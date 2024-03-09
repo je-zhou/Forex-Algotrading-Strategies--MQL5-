@@ -14,6 +14,7 @@
 input group "General Settings"
 input ENUM_TIMEFRAMES Timeframe = PERIOD_CURRENT;
 input int Magic = 2; //--- Need to use magic number for each different EA
+input int maxActiveTrades = 1;
 
 //--- Trade Settings
 input group "Trade Settings";
@@ -21,7 +22,9 @@ input double LotSize = 0.1;
 input double TpPoints = 400;
 input double SlPoints = 200;
 input double SlBuffer = 100;
-
+input int LongTermTrendPeriod = 200;
+input int MediumTermTrendPeriod = 50;
+input int ShortTermTrendPeriod = 20;
 
 //--- Trailing SL Settings
 input group "Trailing SL Settings";
@@ -39,12 +42,19 @@ input int TrendCandles = 3;
 //+------------------------------------------------------------------+
 CTrade trade;
 int barsTotal;
+int longTermMAHandler;
+int medTermMAHandler;
+int shortTermMAHandler;
 
 //+------------------------------------------------------------------+
 //| Init, Deinit, OnTick                                             |
 //+------------------------------------------------------------------+
 
 int OnInit() {
+   longTermMAHandler = iMA(_Symbol, Timeframe, LongTermTrendPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   medTermMAHandler = iMA(_Symbol, Timeframe, MediumTermTrendPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   shortTermMAHandler = iMA(_Symbol, Timeframe, ShortTermTrendPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   
    return(INIT_SUCCEEDED);
 }
 
@@ -53,7 +63,7 @@ void OnDeinit(const int reason) {}
 void OnTick() {
    //--- Monitor current positions
    ModifyPositions();
-  
+   
    //--- Only execute one position per bar
    int bars = iBars(_Symbol, Timeframe);
    
@@ -71,46 +81,70 @@ void OnTick() {
 //+------------------------------------------------------------------+
 //| Strategy                                                         |
 //|------------------------------------------------------------------|
-//|
+//| Trading reversals                                                |
+//| Criteria 1: X candles in one direction, followed by one candle   |    
+//|             in the opposite direction                            |   
+//| Criteria 2: If the opposite direction candle is following the    |    
+//|             higher timeframe trend, place a trade                |  
+//|------------------------------------------------------------------|
+//| Risk Management                                                  |    
+//|------------------------------------------------------------------|
+//| 1. Trades will be place with a SL risking only 1% of the account |
+//| 2. All trades will be placed during London and NY sessions       | 
+//| 3. All trades will be closed before the swap rollover            |                                         
 //+------------------------------------------------------------------+
+
 void TradeLogic() {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
-   double open1 = iOpen(_Symbol, Timeframe, 1);
-   double close1 = iClose(_Symbol, Timeframe, 1);      
+   double longTermMA[];
+   double medTermMA[];
+   double shortTermMA[];
+
+   CopyBuffer(longTermMAHandler,0,0,2,longTermMA);
+   CopyBuffer(medTermMAHandler,0,0,2,medTermMA);
+   CopyBuffer(shortTermMAHandler,0,0,2,shortTermMA);
    
-   //--- Bullish Trend Up - Sell on Red Candle
-   if (open1 < close1) {
-      bool isTrend = true;
-      
-      for (int i = 2; i < TrendCandles + 2; i++) {
-         double openI = iOpen(_Symbol, Timeframe, i);
-         double closeI = iClose(_Symbol, Timeframe, i);
+   double open1 = iOpen(_Symbol, Timeframe, 1);
+   double close1 = iClose(_Symbol, Timeframe, 1);
+   //--- Uptrend, only look for buys
+   if (close1 > longTermMA[1] && close1 > medTermMA[1] && close1 > shortTermMA[1]) {
+      //--- Bullish Trend Up - Sell on Red Candle
+      if (open1 < close1) {
+         bool isTrend = true;
          
-         if (openI < closeI) {
-            isTrend = false;
-         }     
-      }
-      
-      if (isTrend) {
-         OnBuy();
-     }
-   } else {
-   //--- Bearish Candles
-      bool isTrend = true;
-      
-      for (int i = 2; i < TrendCandles + 2; i++) {
-         double openI = iOpen(_Symbol, Timeframe, i);
-         double closeI = iClose(_Symbol, Timeframe, i);
+         for (int i = 2; i < TrendCandles + 2; i++) {
+            double openI = iOpen(_Symbol, Timeframe, i);
+            double closeI = iClose(_Symbol, Timeframe, i);
+            
+            if (openI < closeI) {
+               isTrend = false;
+            }     
+         }
          
-         if (openI > closeI) {
-            isTrend = false;
-         }     
+         if (isTrend) {
+            OnBuy();
+        }
       }
-      
-      if (isTrend) {
-         OnSell();
+   } else if (close1 < longTermMA[0] && close1 < medTermMA[0] && close1 < shortTermMA[0]) {
+   //--- Downtrend, only look for sells
+      //--- Bearish Trend Down - Buy on Green Candle
+      if (close1 < open1) {
+         bool isTrend = true;
+         
+         for (int i = 2; i < TrendCandles + 2; i++) {
+            double openI = iOpen(_Symbol, Timeframe, i);
+            double closeI = iClose(_Symbol, Timeframe, i);
+            
+            if (closeI < openI) {
+               isTrend = false;
+            }     
+         }
+         
+         if (isTrend) {
+            OnSell();
+         }
       }
    }
 }
@@ -133,7 +167,6 @@ void OnSell() {
    
    trade.Sell(LotSize, _Symbol, bid, sl, tp);
 }
-
 
 //+------------------------------------------------------------------+
 //| Modify Current Positions Functions                               |
@@ -161,7 +194,7 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
    if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
       //--- Set Trailing SL if for buy Positions
       if (bid > posPriceOpen + TslTriggerPoints * _Point) {
-         double sl = bid - TslPoints * _Point;
+         double sl = posPriceOpen;
          sl =  NormalizeDouble(sl, _Digits);
          
          if (sl > posSl || posSl == 0) {
@@ -172,7 +205,7 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
    } else {
       //--- Set Trailing SL if for buy Positions
       if (ask < posPriceOpen - TslTriggerPoints * _Point) {
-         double sl = ask + TslPoints * _Point;
+         double sl = posPriceOpen;
          sl =  NormalizeDouble(sl, _Digits);
          
          if (sl > posSl || posSl == 0) {
