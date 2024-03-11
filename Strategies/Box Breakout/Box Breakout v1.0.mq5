@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                                   [TEMPLATE].mq5 |
+//|                                                 Box Template.mq5 |
 //|                                           Based on Template v1.0 |
 //|                                      Copyright 2024, Jerry Zhou. |
 //|                                       https://www.jerryzhou.xyz/ |
@@ -10,7 +10,7 @@
 
 //--- Imports
 #include <trade/trade.mqh>
-
+#include <Object.mqh>
 //+------------------------------------------------------------------+
 //| General Inputs                                                   |
 //+------------------------------------------------------------------+
@@ -44,18 +44,49 @@ input int TimeEndMin = 10;
 //| Strategy Specific Inputs                                         |
 //+------------------------------------------------------------------+
 input group "Strategy Inputs";
+input int RangeStartHour = 2;
+input int RangeStartMinute = 0;
+input int RangeEndHour = 7;
+input int RangeEndMinute = 0;
+input int DeleteOrdersHour = 19;
+input int DeleteOrdersMin = 55;
+input int ClosePositionsHour = 19;
+input int ClosePositionsMin = 55;
+
+//+------------------------------------------------------------------+
+//| Class Definitions                                                |
+//+------------------------------------------------------------------+
+
+class CRange : public CObject {
+public:
+   ulong posTicket;
+   datetime time1;
+   datetime timeX;
+   double high;
+   double low;
+   
+   void drawRect() {
+      string objName = MQLInfoString(MQL_PROGRAM_NAME) + " " + TimeToString(time1); 
+      ObjectCreate(0, objName, OBJ_RECTANGLE, 0, time1, high, timeX, low);
+   }
+};
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                 |
 //+------------------------------------------------------------------+
 CTrade trade;
 int barsTotal;
+CRange range;
 
 //+------------------------------------------------------------------+
 //| Init, Deinit, OnTick                                             |
 //+------------------------------------------------------------------+
 
 int OnInit() {   
+   for (int i = 1; i < 5; i++) {
+      paintRange(i);
+   }
+  
    return(INIT_SUCCEEDED);
 }
 
@@ -67,6 +98,8 @@ void OnTick() {
    //--- Monitor current positions
    ModifyPositions();
    
+   TradeLogic();
+   
    if (timeToTrade()) {
       //--- Only execute one position per bar
       int bars = iBars(_Symbol, Timeframe);
@@ -74,7 +107,7 @@ void OnTick() {
       if (barsTotal != bars) {
          barsTotal = bars;
          
-         TradeLogic();
+         //--- TradeLogic();
       }
    }
 }
@@ -84,25 +117,23 @@ void OnTick() {
 | Strategy                                                         |
 +------------------------------------------------------------------+
 
-**********************[ENTER STRATEGY HERE]*************************
+We will track the highs and lows of the asian session, then trade
+breakouts in the london and ny sessions
+
+Asian Session starts at 
 
 +------------------------------------------------------------------+
 | Risk Management                                                  |    
 +------------------------------------------------------------------+
 
-******************[ENTER RISK MANAGEMENT HERE]**********************
+1. When trade is over 10 pips in profit, set SL to break even
+2. Only risk 2% of the account on each trade
 
 */
 
 void TradeLogic() {
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   
-   //--- Buy Conditions
-   //--- OnBuy();
-   
-   //--- Sell Conditions
-   //--- OnSell();
+
+   paintRange(0);
 }
 
 //+------------------------------------------------------------------+
@@ -198,10 +229,12 @@ bool timeToTrade() {
    
    bool isTime = TimeCurrent() >= timeStart && TimeCurrent() < timeEnd;
    
+   /*
    Comment("\nServer Time: ", TimeCurrent(),
            "\nTime Start Dt: ", timeStart,
            "\nTime End Dt: ", timeEnd,
            "\nTimeFilter: ", isTime);
+   */
            
    return isTime;
 }
@@ -219,4 +252,54 @@ double calcLots(double slPoints){
    lots = MathMax(lots,SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN));
    
    return lots;
+}
+
+void paintRange(int dayShift) {
+   MqlDateTime structTime;
+   MqlDateTime currentTime;
+   TimeCurrent(structTime);
+   TimeCurrent(currentTime);
+   structTime.day = structTime.day - dayShift;
+   currentTime.day = currentTime.day - dayShift;
+   
+   //--- skip if its a Saturday or Sunday
+   if (structTime.day_of_week == 6 || structTime.day_of_week == 0) return; 
+   
+   structTime.sec = 0;
+   
+   structTime.hour = RangeStartHour;
+   structTime.min = RangeStartMinute;
+   datetime timeStart = StructToTime(structTime);
+   
+   if (currentTime.hour < RangeEndHour && dayShift == 0) {
+      structTime.hour = currentTime.hour;
+      structTime.min = currentTime.min;
+   } else {
+      structTime.hour = RangeEndHour;
+      structTime.min = RangeEndMinute;
+   }
+   
+   datetime timeEnd = StructToTime(structTime);   
+   
+   //--- Find high and low within range
+   int start_shift = iBarShift(_Symbol, Timeframe, timeStart);
+   int end_shift = iBarShift(_Symbol, Timeframe, timeEnd);
+   int barCount = start_shift - end_shift;
+   
+   int highestBar = iHighest(_Symbol, Timeframe, MODE_HIGH, barCount, end_shift);
+   int lowestBar = iLowest(_Symbol, Timeframe, MODE_LOW, barCount, end_shift);
+   double high = iHigh(_Symbol, Timeframe, highestBar);
+   double low = iLow(_Symbol, Timeframe, lowestBar);  
+    
+   //--- Paint the range
+   ObjectCreate(0, "Range - " + dayShift, OBJ_RECTANGLE, 0, timeStart, low, timeEnd, high);
+   ObjectSetInteger(0, "Range - " + dayShift, OBJPROP_FILL, true);
+   
+   //--- Paint the trading time
+   structTime.hour = TimeEndHour;
+   structTime.min = TimeEndMin;
+   datetime tradingEnd = StructToTime(structTime);
+   
+   ObjectCreate(0, "Trading Period - " + dayShift, OBJ_RECTANGLE, 0, timeStart, high, tradingEnd, high);
+   ObjectCreate(0, "Trading Period - " + dayShift, OBJ_RECTANGLE, 0, timeStart, low, tradingEnd, low);
 }
