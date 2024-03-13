@@ -44,9 +44,9 @@ input int TimeEndMin = 10;
 //| Strategy Specific Inputs                                         |
 //+------------------------------------------------------------------+
 input group "Strategy Inputs";
-input int RangeStartHour = 2;
+input int RangeStartHour = 0;
 input int RangeStartMinute = 0;
-input int RangeEndHour = 7;
+input int RangeEndHour = 6;
 input int RangeEndMinute = 0;
 input int DeleteOrdersHour = 19;
 input int DeleteOrdersMin = 55;
@@ -60,14 +60,77 @@ input int ClosePositionsMin = 55;
 class CRange : public CObject {
 public:
    ulong posTicket;
-   datetime time1;
-   datetime timeX;
+   datetime timeStart;
+   datetime timeEnd;
+   int dayShift;
    double high;
    double low;
+   CRange(int ds) { dayShift = ds; }
+   
+   void commentRange() {
+      Comment("\nRange Start: ", timeStart,
+              "\nRange End: ", timeEnd,
+              "\nRange High: ", high,
+              "\nRange Low: ", low);
+   }
+   
+   void calculateRange() {
+      MqlDateTime structTime;
+      MqlDateTime currentTime;
+      TimeCurrent(structTime);
+      TimeCurrent(currentTime);
+      structTime.day = structTime.day - dayShift;
+      currentTime.day = currentTime.day - dayShift;
+      
+      //--- skip if its a Saturday or Sunday
+      if (structTime.day_of_week == 6 || structTime.day_of_week == 0) return; 
+      
+      structTime.sec = 0;
+      
+      structTime.hour = RangeStartHour;
+      structTime.min = RangeStartMinute;
+      timeStart = StructToTime(structTime);
+      
+      if (currentTime.hour < RangeEndHour && dayShift == 0) {
+         structTime.hour = currentTime.hour;
+         structTime.min = currentTime.min;
+      } else {
+         structTime.hour = RangeEndHour;
+         structTime.min = RangeEndMinute;
+      }
+      
+      timeEnd = StructToTime(structTime);   
+      
+      //--- Find high and low within range
+      int start_shift = iBarShift(_Symbol, Timeframe, timeStart);
+      int end_shift = iBarShift(_Symbol, Timeframe, timeEnd);
+      int barCount = start_shift - end_shift;
+      
+      int highestBar = iHighest(_Symbol, Timeframe, MODE_HIGH, barCount, end_shift);
+      int lowestBar = iLowest(_Symbol, Timeframe, MODE_LOW, barCount, end_shift);
+      high = iHigh(_Symbol, Timeframe, highestBar);
+      low = iLow(_Symbol, Timeframe, lowestBar);    
+   }
    
    void drawRect() {
-      string objName = MQLInfoString(MQL_PROGRAM_NAME) + " " + TimeToString(time1); 
-      ObjectCreate(0, objName, OBJ_RECTANGLE, 0, time1, high, timeX, low);
+      MqlDateTime structTime;
+      TimeCurrent(structTime);
+      structTime.day = structTime.day - dayShift;
+      structTime.sec = 0;
+      
+      string objName = MQLInfoString(MQL_PROGRAM_NAME) + " " + TimeToString(timeStart); 
+      
+      //--- Paint the range
+      ObjectCreate(0, "Range - " + dayShift, OBJ_RECTANGLE, 0, timeStart, low, timeEnd, high);
+      ObjectSetInteger(0, "Range - " + dayShift, OBJPROP_FILL, true);
+      
+      //--- Paint the trading time
+      structTime.hour = ClosePositionsHour;
+      structTime.min = ClosePositionsHour;
+      datetime tradingEnd = StructToTime(structTime);
+      
+      ObjectCreate(0, "Trading Period High - " + dayShift, OBJ_RECTANGLE, 0, timeStart, high, tradingEnd, high);
+      ObjectCreate(0, "Trading Period Low - " + dayShift, OBJ_RECTANGLE, 0, timeStart, low, tradingEnd, low);
    }
 };
 
@@ -76,7 +139,7 @@ public:
 //+------------------------------------------------------------------+
 CTrade trade;
 int barsTotal;
-CRange range;
+CRange activeRange(0);
 
 //+------------------------------------------------------------------+
 //| Init, Deinit, OnTick                                             |
@@ -84,7 +147,9 @@ CRange range;
 
 int OnInit() {   
    for (int i = 1; i < 5; i++) {
-      paintRange(i);
+      CRange range(i);
+      range.calculateRange();
+      range.drawRect();
    }
   
    return(INIT_SUCCEEDED);
@@ -98,17 +163,22 @@ void OnTick() {
    //--- Monitor current positions
    ModifyPositions();
    
-   TradeLogic();
+   activeRange.calculateRange();
+   activeRange.drawRect();
    
    if (timeToTrade()) {
-      //--- Only execute one position per bar
-      int bars = iBars(_Symbol, Timeframe);
-      
-      if (barsTotal != bars) {
-         barsTotal = bars;
-         
-         //--- TradeLogic();
+      if(activeRange.posTicket <= 0) {
+         TradeLogic();
       }
+     
+   } else {
+      //-- Close all positions
+      
+      Print("Closing all positions");
+      Print(activeRange.posTicket);
+      Print(trade.PositionClose(activeRange.posTicket));
+      activeRange.posTicket = 0; 
+      
    }
 }
 
@@ -131,10 +201,20 @@ Asian Session starts at
 
 */
 
-void TradeLogic() {
-
-   paintRange(0);
+void TradeLogic() {   
+   double ask = SymbolInfoDouble(NULL, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(NULL, SYMBOL_BID);
+   
+   //--- Buy when price goes above range high
+   if (ask > activeRange.high) {
+      OnBuy();
+   }
+   
+   if (bid < activeRange.low) {
+      OnSell();
+   }
 }
+
 
 //+------------------------------------------------------------------+
 //| Buy & Sell Functions                                             |
@@ -142,25 +222,28 @@ void TradeLogic() {
 //--- On Buy
 void OnBuy() {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double tp = ask + TpPoints * _Point;
-   double sl = ask - SlPoints * _Point;
+   double sl = activeRange.low;
    
    double lots = LotSize;
    if(RiskPercent > 0) lots = calcLots(ask-sl);
    
-   trade.Buy(lots, _Symbol, ask, sl, tp);
+   trade.Buy(lots, _Symbol, ask, sl, 0);
+   Print("Buy Order: ", trade.ResultOrder());
+   activeRange.posTicket = trade.ResultOrder();
 }
 
 //--- On Sell
 void OnSell() {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double tp = bid - TpPoints * _Point;
-   double sl = bid + SlPoints * _Point;
+   double sl = activeRange.high;
    
    double lots = LotSize;
    if(RiskPercent > 0) lots = calcLots(sl-bid);
    
-   trade.Sell(lots, _Symbol, bid, sl, tp);
+   trade.Sell(lots, _Symbol, bid, sl, 0);
+   Print("Sell Order: ", trade.ResultOrder());
+   activeRange.posTicket = trade.ResultOrder();
 }
 
 //+------------------------------------------------------------------+
@@ -219,22 +302,15 @@ bool timeToTrade() {
    TimeCurrent(structTime);
    structTime.sec = 0;
    
-   structTime.hour = TimeStartHour;
-   structTime.min = TimeStartMin;
+   structTime.hour = RangeEndHour;
+   structTime.min = RangeEndMinute;
    datetime timeStart = StructToTime(structTime);
    
-   structTime.hour = TimeEndHour;
-   structTime.min = TimeEndMin;
+   structTime.hour = ClosePositionsHour;
+   structTime.min = ClosePositionsMin;
    datetime timeEnd = StructToTime(structTime);
    
    bool isTime = TimeCurrent() >= timeStart && TimeCurrent() < timeEnd;
-   
-   /*
-   Comment("\nServer Time: ", TimeCurrent(),
-           "\nTime Start Dt: ", timeStart,
-           "\nTime End Dt: ", timeEnd,
-           "\nTimeFilter: ", isTime);
-   */
            
    return isTime;
 }
@@ -254,52 +330,16 @@ double calcLots(double slPoints){
    return lots;
 }
 
-void paintRange(int dayShift) {
-   MqlDateTime structTime;
-   MqlDateTime currentTime;
-   TimeCurrent(structTime);
-   TimeCurrent(currentTime);
-   structTime.day = structTime.day - dayShift;
-   currentTime.day = currentTime.day - dayShift;
-   
-   //--- skip if its a Saturday or Sunday
-   if (structTime.day_of_week == 6 || structTime.day_of_week == 0) return; 
-   
-   structTime.sec = 0;
-   
-   structTime.hour = RangeStartHour;
-   structTime.min = RangeStartMinute;
-   datetime timeStart = StructToTime(structTime);
-   
-   if (currentTime.hour < RangeEndHour && dayShift == 0) {
-      structTime.hour = currentTime.hour;
-      structTime.min = currentTime.min;
-   } else {
-      structTime.hour = RangeEndHour;
-      structTime.min = RangeEndMinute;
+void CloseAllPositions() {
+   for (int i=0; i < PositionsTotal(); i++) {
+      ulong posTicket = PositionGetTicket(i);
+      
+      if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
+      if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
+      
+      Print("Closing Ticket: ", posTicket);
+      
+      trade.PositionClose(posTicket); 
+      
    }
-   
-   datetime timeEnd = StructToTime(structTime);   
-   
-   //--- Find high and low within range
-   int start_shift = iBarShift(_Symbol, Timeframe, timeStart);
-   int end_shift = iBarShift(_Symbol, Timeframe, timeEnd);
-   int barCount = start_shift - end_shift;
-   
-   int highestBar = iHighest(_Symbol, Timeframe, MODE_HIGH, barCount, end_shift);
-   int lowestBar = iLowest(_Symbol, Timeframe, MODE_LOW, barCount, end_shift);
-   double high = iHigh(_Symbol, Timeframe, highestBar);
-   double low = iLow(_Symbol, Timeframe, lowestBar);  
-    
-   //--- Paint the range
-   ObjectCreate(0, "Range - " + dayShift, OBJ_RECTANGLE, 0, timeStart, low, timeEnd, high);
-   ObjectSetInteger(0, "Range - " + dayShift, OBJPROP_FILL, true);
-   
-   //--- Paint the trading time
-   structTime.hour = TimeEndHour;
-   structTime.min = TimeEndMin;
-   datetime tradingEnd = StructToTime(structTime);
-   
-   ObjectCreate(0, "Trading Period - " + dayShift, OBJ_RECTANGLE, 0, timeStart, high, tradingEnd, high);
-   ObjectCreate(0, "Trading Period - " + dayShift, OBJ_RECTANGLE, 0, timeStart, low, tradingEnd, low);
-}
+  }
