@@ -17,39 +17,29 @@
 //--- General Settings
 input group "General Settings"
 input ENUM_TIMEFRAMES Timeframe = PERIOD_CURRENT;
-input int Magic = 2; //--- Need to use magic number for each different EA
-input int maxActiveTrades = 1;
+input int Magic = 1; //Magic (Need to use magic number for each different EA)
 
 //--- Trade Settings
 input group "Trade Settings";
 input double LotSize = 0.1;
-input double RiskPercent = 2.0; //RiskPercent (0 = Fix)
-input double TpPoints = 300;
-input double SlPoints = 150;
+input double RiskPercent = 2.0; //RiskPercent (0 = Use Fixed LotSize)
+input double TpPoints = 300; //TPoints (0 = No TP)
+input double TpFactor = 1; //TpFactor (0 = Use TpPoints)
 
 //--- Trailing SL Settings
 input group "Trailing SL Settings";
-input double TslTriggerPoints = 100;
-input double TslPoints = 100;
-
-//--- Filter Settings
-input group "Time Filter Settings";
-input int TimeStartHour = 7;
-input int TimeStartMin = 10;
-
-input int TimeEndHour = 15;
-input int TimeEndMin = 10;
+input double TslTriggerPoints = 150; //TslTriggerPoints (0 = No Tsl)
+input double TslTriggerFactor = 0.5; //TslTriggerFactor (0 = Use TslTriggerPoints)
+input double TslPoints = 0; //TslPoints (0 = Breakeven)
 
 //+------------------------------------------------------------------+
 //| Strategy Specific Inputs                                         |
 //+------------------------------------------------------------------+
 input group "Strategy Inputs";
-input int RangeStartHour = 0;
+input int RangeStartHour = 2;
 input int RangeStartMinute = 0;
-input int RangeEndHour = 6;
-input int RangeEndMinute = 0;
-input int DeleteOrdersHour = 19;
-input int DeleteOrdersMin = 55;
+input int RangeEndHour = 3;
+input int RangeEndMinute = 30;
 input int ClosePositionsHour = 19;
 input int ClosePositionsMin = 55;
 
@@ -59,12 +49,13 @@ input int ClosePositionsMin = 55;
 
 class CRange : public CObject {
 public:
-   ulong posTicket;
    datetime timeStart;
    datetime timeEnd;
    int dayShift;
    double high;
    double low;
+   bool buyPlaced;
+   bool sellPlaced;
    CRange(int ds) { dayShift = ds; }
    
    void commentRange() {
@@ -138,7 +129,6 @@ public:
 //| Global Variables                                                 |
 //+------------------------------------------------------------------+
 CTrade trade;
-int barsTotal;
 CRange activeRange(0);
 
 //+------------------------------------------------------------------+
@@ -151,6 +141,9 @@ int OnInit() {
       range.calculateRange();
       range.drawRect();
    }
+   
+   activeRange.buyPlaced = false;
+   activeRange.sellPlaced = false;
   
    return(INIT_SUCCEEDED);
 }
@@ -165,20 +158,19 @@ void OnTick() {
    
    activeRange.calculateRange();
    activeRange.drawRect();
+   //--- activeRange.commentRange();
    
    if (timeToTrade()) {
-      if(activeRange.posTicket <= 0) {
-         TradeLogic();
+      if(PositionsTotal() == 0) {
+         TradeLogic();  
       }
      
    } else {
       //-- Close all positions
-      
-      Print("Closing all positions");
-      Print(activeRange.posTicket);
-      Print(trade.PositionClose(activeRange.posTicket));
-      activeRange.posTicket = 0; 
-      
+     
+      CloseAllPositions();
+      activeRange.sellPlaced = false;
+      activeRange.buyPlaced = false;
    }
 }
 
@@ -187,10 +179,8 @@ void OnTick() {
 | Strategy                                                         |
 +------------------------------------------------------------------+
 
-We will track the highs and lows of the asian session, then trade
+We will track the highs and lows of the range, then trade
 breakouts in the london and ny sessions
-
-Asian Session starts at 
 
 +------------------------------------------------------------------+
 | Risk Management                                                  |    
@@ -206,11 +196,11 @@ void TradeLogic() {
    double bid = SymbolInfoDouble(NULL, SYMBOL_BID);
    
    //--- Buy when price goes above range high
-   if (ask > activeRange.high) {
+   if (ask > activeRange.high && !activeRange.buyPlaced) {
       OnBuy();
    }
    
-   if (bid < activeRange.low) {
+   if (bid < activeRange.low && !activeRange.sellPlaced) {
       OnSell();
    }
 }
@@ -227,23 +217,40 @@ void OnBuy() {
    double lots = LotSize;
    if(RiskPercent > 0) lots = calcLots(ask-sl);
    
-   trade.Buy(lots, _Symbol, ask, sl, 0);
-   Print("Buy Order: ", trade.ResultOrder());
-   activeRange.posTicket = trade.ResultOrder();
+   double tp = 0;
+   
+   if (TpFactor > 0) {
+      tp = ask + (activeRange.high - activeRange.low) * TpFactor;
+   } else if (TpFactor == 0 && TpPoints > 0) {
+      tp = ask + TpPoints * _Point;
+   }
+   
+   if (trade.Buy(lots, _Symbol, ask, sl, tp)) {
+      Print("Buy Order: ", trade.ResultOrder());
+      activeRange.buyPlaced = true;
+   }
 }
 
 //--- On Sell
 void OnSell() {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double tp = bid - TpPoints * _Point;
    double sl = activeRange.high;
    
    double lots = LotSize;
    if(RiskPercent > 0) lots = calcLots(sl-bid);
    
-   trade.Sell(lots, _Symbol, bid, sl, 0);
-   Print("Sell Order: ", trade.ResultOrder());
-   activeRange.posTicket = trade.ResultOrder();
+   double tp = 0;
+   
+   if (TpFactor > 0) {
+      tp = bid - (activeRange.high - activeRange.low) * TpFactor;
+   } else if (TpFactor == 0 && TpPoints > 0) {
+      tp = bid - TpPoints * _Point;
+   }
+   
+   if (trade.Sell(lots, _Symbol, bid, sl, tp)) {
+      Print("Sell Order: ", trade.ResultOrder());
+      activeRange.sellPlaced = true;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -256,10 +263,10 @@ void ModifyPositions() {
    for (int i=0; i < PositionsTotal(); i++) {
       ulong posTicket = PositionGetTicket(i);
       
-      if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
+      //--- if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
       if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
         
-       SetTrailingSL(ask, bid, posTicket);
+      SetTrailingSL(ask, bid, posTicket);
    }
 }
 
@@ -271,8 +278,19 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
    
    if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
       //--- Set trailing SL for buy positions
-      if (bid > posPriceOpen + TslTriggerPoints * _Point) {
-         double sl = posPriceOpen; //--- SL set to breakeven
+      double tslTrigger = bid + 1;
+      
+      //--- Calculate TSL Trigger based on 
+      if (TslTriggerFactor > 0) {
+         tslTrigger = posPriceOpen + (posPriceOpen - posSl) * TslTriggerFactor;
+      } else if (TslTriggerFactor == 0 && TslPoints > 0) {
+         tslTrigger = posPriceOpen + TslPoints * _Point;
+      }
+   
+      
+      if (bid > tslTrigger) {
+         double sl = posPriceOpen + TslPoints * _Point;
+         
          sl =  NormalizeDouble(sl, _Digits);
          
          if (sl > posSl || posSl == 0) {
@@ -282,11 +300,20 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
       }
    } else {
       //--- Set trailing SL for sell positions
-      if (ask < posPriceOpen - TslTriggerPoints * _Point) {
-         double sl = posPriceOpen; //--- SL set to breakeven
+      double tslTrigger = ask - 1;
+      
+      //--- Calculate TSL Trigger based on 
+      if (TslTriggerFactor > 0) {
+         tslTrigger = posPriceOpen - (posSl - posPriceOpen) * TslTriggerFactor;
+      } else if (TslTriggerFactor == 0 && TslPoints > 0) {
+         tslTrigger = posPriceOpen - TslPoints * _Point;
+      }
+      
+      if (ask < tslTrigger) {
+         double sl = posPriceOpen - TslPoints * _Point;
          sl =  NormalizeDouble(sl, _Digits);
          
-         if (sl > posSl || posSl == 0) {
+         if (sl < posSl || posSl == 0) {
             trade.PositionModify(posTicket, sl, posTp);
             Print("Position: ", posTicket, " Modified - SL set to breakeven");
          }
@@ -310,7 +337,7 @@ bool timeToTrade() {
    structTime.min = ClosePositionsMin;
    datetime timeEnd = StructToTime(structTime);
    
-   bool isTime = TimeCurrent() >= timeStart && TimeCurrent() < timeEnd;
+   bool isTime = TimeCurrent() >= timeStart && TimeCurrent() <= timeEnd;
            
    return isTime;
 }
@@ -334,12 +361,11 @@ void CloseAllPositions() {
    for (int i=0; i < PositionsTotal(); i++) {
       ulong posTicket = PositionGetTicket(i);
       
+      /*
       if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
       if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
-      
+      */
       Print("Closing Ticket: ", posTicket);
-      
       trade.PositionClose(posTicket); 
-      
    }
-  }
+}
