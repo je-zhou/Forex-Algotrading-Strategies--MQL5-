@@ -43,15 +43,33 @@ Below is a short explaination of what each input does.
 - TslTriggerFactor: A multiple of the range at which you want to set a trailing stop loss. Has priority over TslTriggerPoints.
 - TslPoints: The number of fixed points you want to set to set the new stop loss at. 0 means setting the stop loss to breakeven.
 
+#### Trend Settings
+
+- TradeWithTrend: Forces strategy to only trade with the trend.
+- TrendMaTimeframe: The timeframe the trending moving average should be calculated.
+- SlowTrendMaMethod: The type of moving average used to determine the slow trend.
+- SlowTrendMaPeriod: The period used to calculate the slow trending moving average.
+- FastTrendMaMethod: The type of moving average used to determine the fast trend.
+- FastTrendMaPeriod: The period used to calculate the fast trending moving average.
+- RangeBuffer: Amount in points between the two moving averages to represent a ranging market.
+
 #### Strategy Specific Inputs
 
 - RangeStartHour: The hour you want the range to start tracking at (0 - 23).
 - RangeStartMin: The minute you want the range to start tracking at (0 - 59).
 - RangeEndHour: The hour you want the range to stop tracking at (0 - 23).
 - RangeEndMin: The minute you want the range to stop tracking at (0 - 59).
+- StopTradingHour: The hour you want to stop placing any new orders at (0 - 23).
+- StopTradingMinute = The minute you want to stop placing any new orders at (0 - 59).
 - ClosePositionsHour: The hour you want to close all positions at (0 - 23).
 - ClosePositionsHour: The minute you want to close all positions at (0 - 59).
 
-## Version Control
+## ChangeLog
 
-- v1.0: First release of the trading bot, with optimised inputs for trading the USD/JPY pair.
+- v1.1:
+  - Persistant boxes to make testing clearer
+  - Added trading stop time (which can be earlier than the exit all positions time)
+  - Added Option to trade with trend based on fast and slow moving averages
+  - Changed the buy and sell orders from market to stops
+- v1.0:
+  - First release of the trading bot, with optimised inputs for trading the USD/JPY pair.
