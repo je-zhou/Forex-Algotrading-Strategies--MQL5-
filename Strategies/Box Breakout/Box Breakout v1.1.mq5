@@ -30,25 +30,25 @@ input int Magic = 1; //Magic (Need to use magic number for each different EA)
 //--- Trade Settings
 input group "Trade Settings";
 input double LotSize = 0.1;
-input double RiskPercent = 1; //RiskPercent (0 = Use Fixed LotSize)
+input double RiskPercent = 0.5; //RiskPercent (0 = Use Fixed LotSize)
 input double TpPoints = 0; //TPoints (0 = No TP)
-input double TpFactor = 1.5; //TpFactor (0 = Use TpPoints)
+input double TpFactor = 0; //TpFactor (0 = Use TpPoints)
 
 //--- Trailing SL Settings
 input group "Trailing SL Settings";
 input double TslTriggerPoints = 0; //TslTriggerPoints (0 = No Tsl)
-input double TslTriggerFactor = 0.8; //TslTriggerFactor (0 = Use TslTriggerPoints)
-input double TslPoints = 0; //TslPoints (0 = Breakeven)
+input double TslTriggerFactor = 0.75; //TslTriggerFactor (0 = Use TslTriggerPoints)
+input double TslPoints = 25; //TslPoints (0 = Breakeven)
 
 //--- Trend Settings
 input group "Trend Settings";
-input bool TradeWithTrend = false; //TradeWithTrend (Forces strategy to only trade with the trend)
-input ENUM_TIMEFRAMES TrendMaTimeframe = PERIOD_CURRENT; //TrendMaTimeframe (The timeframe the trending moving average should be calculated)
+input bool TradeWithTrend = true; //TradeWithTrend (Forces strategy to only trade with the trend)
+input ENUM_TIMEFRAMES TrendMaTimeframe = PERIOD_M6; //TrendMaTimeframe (The timeframe the trending moving average should be calculated)
 input ENUM_MA_METHOD SlowTrendMaMethod = MODE_SMA; //SlowTrendMaMethod (The type of moving average used to determine the slow trend)
 input int SlowTrendMaPeriod = 200; //SlowTrendMaPeriod (The period used to calculate the slow trending moving average)
-input ENUM_MA_METHOD FastTrendMaMethod = MODE_SMA; //FastTrendMaMethod (The type of moving average used to determine the fast trend)
-input int FastTrendMaPeriod = 55; //FastTrendMaPeriod (The period used to calculate the fast trending moving average) 
-input double RangeBuffer = 25; //RangeBuffer (Amount in points between the two moving averages to represent a ranging market)
+input ENUM_MA_METHOD FastTrendMaMethod = MODE_SMMA; //FastTrendMaMethod (The type of moving average used to determine the fast trend)
+input int FastTrendMaPeriod = 60; //FastTrendMaPeriod (The period used to calculate the fast trending moving average) 
+input double RangeBuffer = 0; //RangeBuffer (Amount in points between the two moving averages to represent a ranging market)
 
 //+------------------------------------------------------------------+
 //| Strategy Specific Inputs                                         |
@@ -57,8 +57,8 @@ input group "Strategy Inputs";
 input int RangeStartHour = 3;
 input int RangeStartMinute = 0;
 input int RangeEndHour = 7;
-input int RangeEndMinute = 0;
-input int StopTradingHour = 16;
+input int RangeEndMinute = 30;
+input int StopTradingHour = 17;
 input int StopTradingMinute = 30;
 input int ClosePositionsHour = 19;
 input int ClosePositionsMinute = 55;
@@ -76,13 +76,18 @@ public:
    double low;
    bool buyPlaced;
    bool sellPlaced;
+   TrendType sessionTrend;
+   bool timeToTrade;
    CRange(int ds) { dayShift = ds; }
    
    void commentRange() {
       Comment("\nRange Start: ", timeStart,
               "\nRange End: ", timeEnd,
               "\nRange High: ", high,
-              "\nRange Low: ", low);
+              "\nRange Low: ", low,
+              "\nSession Trend: ", sessionTrend,
+              "\nTime to Trade: ", timeToTrade
+              );
    }
    
    void calculateRange() {
@@ -181,7 +186,7 @@ void OnTick() {
    //--- Monitor current positions
    ModifyPositions();
    
-   //--- activeRange.commentRange();
+   activeRange.commentRange();
    
    if (timeToCalculateRange()){
       activeRange.calculateRange();
@@ -189,10 +194,15 @@ void OnTick() {
    }
    
    if (timeToTrade()) {
+      activeRange.calculateRange();
+      activeRange.drawRect();
+      activeRange.timeToTrade = true;
+      
       if(PositionsTotal() == 0) {
          TradeLogic();  
       }
-     
+   } else {
+      activeRange.timeToTrade = false;
    }
    
    if (timeToClosePositions()) {
@@ -224,15 +234,14 @@ breakouts in the london and ny sessions
 void TradeLogic() {   
    double ask = SymbolInfoDouble(NULL, SYMBOL_ASK);
    double bid = SymbolInfoDouble(NULL, SYMBOL_BID);
+   activeRange.sessionTrend = determineTrend();
    
    bool trendingUp = true;
    bool trendingDown = true;
    
    if (TradeWithTrend) {
-      TrendType trendType = determineTrend();
-      
-      trendingUp = trendType == Uptrend;
-      trendingDown = trendType == Downtrend;
+      trendingUp = activeRange.sessionTrend == Uptrend;
+      trendingDown = activeRange.sessionTrend == Downtrend;
    }
    
    
@@ -388,7 +397,11 @@ bool timeToTrade() {
    structTime.min = RangeEndMinute;
    datetime timeStart = StructToTime(structTime);
    
-   bool isTime = TimeCurrent() == timeStart;
+   structTime.hour = StopTradingHour;
+   structTime.min = StopTradingMinute;
+   datetime timeEnd = StructToTime(structTime);
+   
+   bool isTime = TimeCurrent() > timeStart && TimeCurrent() < timeEnd;
            
    return isTime;
 }
