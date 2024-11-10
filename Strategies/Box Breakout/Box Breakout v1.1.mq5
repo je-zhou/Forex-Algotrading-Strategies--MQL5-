@@ -396,12 +396,12 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
 //| Utilities                                                        |
 //+------------------------------------------------------------------+
 int PositionsTotalByMagic(int magic) {
-  int total = 0;
-  for (int i=0; i < PositionsTotal(); i++) {
-    PositionGetTicket(i)
-    if (PositionGetInteger(POSITION_MAGIC) == magic) total++;
-  }
-  return total;
+   int total = 0;
+   for (int i=0; i < PositionsTotal(); i++) {
+      PositionGetTicket(i);
+      if (PositionGetInteger(POSITION_MAGIC) == magic) total++;
+   }
+   return total;
 }
 
 bool timeToTrade() {
