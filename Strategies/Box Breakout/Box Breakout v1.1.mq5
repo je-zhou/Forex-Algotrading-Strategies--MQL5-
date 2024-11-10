@@ -183,9 +183,13 @@ void OnDeinit(const int reason) {
 }
 
 void OnTick() {
-   //--- Monitor current positions
-   ModifyPositions();
-   
+   int positions = PositionsTotalByMagic(Magic);
+
+   if (positions > 0) {
+      //--- Monitor current positions
+      ModifyPositions();
+   }
+
    activeRange.commentRange();
    
    if (timeToCalculateRange()){
@@ -329,8 +333,11 @@ void ModifyPositions() {
       
       //--- if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
       if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
-        
-      SetTrailingSL(ask, bid, posTicket);
+
+      // Check if TSL is enabled
+      if (TslTriggerPoints != 0 && TslTriggerFactor != 0) {
+         SetTrailingSL(ask, bid, posTicket);
+      }
    }
 }
 
@@ -342,7 +349,7 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
    
    if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
       //--- Set trailing SL for buy positions
-      double tslTrigger = bid + 1;
+      double tslTrigger = posPriceOpen;
       
       //--- Calculate TSL Trigger based on 
       if (TslTriggerFactor > 0) {
@@ -388,6 +395,15 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
 //+------------------------------------------------------------------+
 //| Utilities                                                        |
 //+------------------------------------------------------------------+
+int PositionsTotalByMagic(int magic) {
+  int total = 0;
+  for (int i=0; i < PositionsTotal(); i++) {
+    PositionGetTicket(i)
+    if (PositionGetInteger(POSITION_MAGIC) == magic) total++;
+  }
+  return total;
+}
+
 bool timeToTrade() {
    MqlDateTime structTime;
    TimeCurrent(structTime);
@@ -457,10 +473,9 @@ void CloseAllPositions() {
    for (int i=0; i < PositionsTotal(); i++) {
       ulong posTicket = PositionGetTicket(i);
       
-      /*
       if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
       if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
-      */
+
       Print("Closing Ticket: ", posTicket);
       trade.PositionClose(posTicket); 
    }
