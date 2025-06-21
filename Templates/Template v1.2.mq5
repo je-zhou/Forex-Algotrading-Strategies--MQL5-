@@ -9,8 +9,14 @@
 #property version   "1.20"
 
 //--- Imports
-#include <trade/trade.mqh>
-#include <Object.mqh>
+#include <Trade\Trade.mqh>
+
+//--- Custom Types
+enum TrendType {
+   Uptrend = 1,
+   Downtrend = 2,
+   Ranging = 3,
+};
 
 //+------------------------------------------------------------------+
 //| General Inputs                                                   |
@@ -18,8 +24,7 @@
 //--- General Settings
 input group "General Settings"
 input ENUM_TIMEFRAMES Timeframe = PERIOD_CURRENT;
-input int Magic = 2; //--- Need to use magic number for each different EA
-input int maxActiveTrades = 1;
+input int Magic = 2; //Magic (Need to use magic number for each different EA)
 
 //--- Trade Settings
 input group "Trade Settings";
@@ -29,12 +34,23 @@ input double TpPoints = 0; //TPoints (0 = No TP)
 input double TpFactor = 0; //TpFactor (0 = Use TpPoints)
 input double SlPoints = 0; //SLPoints (0 = No SL)
 input double SlFactor = 0; //SlFactor (0 = Use SlPoints)
+input int MaxTradesPerDay = 3; //MaxTradesPerDay (Maximum number of executed trades per day - EA cancels remaining orders when limit reached)
 
 //--- Trailing SL Settings
 input group "Trailing SL Settings";
 input double TslTriggerPoints = 0; //TslTriggerPoints (0 = No Tsl)
 input double TslTriggerFactor = 0.75; //TslTriggerFactor (0 = Use TslTriggerPoints)
 input double TslPoints = 25; //TslPoints (0 = Breakeven)
+
+//--- Trend Settings
+input group "Trend Settings";
+input bool TradeWithTrend = true; //TradeWithTrend (Forces strategy to only trade with the trend)
+input ENUM_TIMEFRAMES TrendMaTimeframe = PERIOD_H1; //TrendMaTimeframe (The timeframe the trending moving average should be calculated)
+input ENUM_MA_METHOD SlowTrendMaMethod = MODE_SMA; //SlowTrendMaMethod (The type of moving average used to determine the slow trend)
+input int SlowTrendMaPeriod = 200; //SlowTrendMaPeriod (The period used to calculate the slow trending moving average)
+input ENUM_MA_METHOD FastTrendMaMethod = MODE_SMMA; //FastTrendMaMethod (The type of moving average used to determine the fast trend)
+input int FastTrendMaPeriod = 60; //FastTrendMaPeriod (The period used to calculate the fast trending moving average) 
+input double RangeBuffer = 0; //RangeBuffer (Amount in points between the two moving averages to represent a ranging market)
 
 //--- Filter Settings
 input group "Time Filter Settings";
@@ -59,12 +75,33 @@ input group "Strategy Inputs";
 //+------------------------------------------------------------------+
 CTrade trade;
 int barsTotal;
+int handleSlowTrendMa;
+int handleFastTrendMa;
+int currentDay;
+int executedTradesToday;
 
 //+------------------------------------------------------------------+
 //| Init, Deinit, OnTick                                             |
 //+------------------------------------------------------------------+
 
 int OnInit() {   
+   // Initialize trade object with magic number
+   trade.SetExpertMagicNumber(Magic);
+   
+   // Initialize trend indicators
+   handleSlowTrendMa = iMA(_Symbol, TrendMaTimeframe, SlowTrendMaPeriod, 0, SlowTrendMaMethod, PRICE_CLOSE);
+   handleFastTrendMa = iMA(_Symbol, TrendMaTimeframe, FastTrendMaPeriod, 0, FastTrendMaMethod, PRICE_CLOSE);
+   
+   // Initialize day counter
+   CheckAndUpdateDay();
+   
+   // Debug information on startup
+   Print("=== EA Initialization ===");
+   Print("Magic Number: ", Magic);
+   Print("Max Trades Per Day: ", MaxTradesPerDay);
+   Print("Trade With Trend: ", TradeWithTrend);
+   Print("========================");
+   
    return(INIT_SUCCEEDED);
 }
 
@@ -73,29 +110,53 @@ void OnDeinit(const int reason) {
 }
 
 void OnTick() {
-   bool timeToTrade = timeToTrade();
    int positions = PositionsTotalByMagic(Magic);
    int orders = OrdersTotalByMagic(Magic);
-   
+
+   // Check and update day counter
+   CheckAndUpdateDay();
+
+   // Check if a new position was opened (order executed)
+   static int lastPositions = 0;
+   if (positions > lastPositions) {
+      // New position opened - increment executed trades counter
+      executedTradesToday++;
+      Print("Position opened! Executed trades today: ", executedTradesToday, "/", MaxTradesPerDay);
+      
+      // Cancel all remaining pending orders when we've reached the daily limit
+      if (executedTradesToday >= MaxTradesPerDay) {
+         Print("Daily trade limit reached (", MaxTradesPerDay, "). Cancelling all remaining pending orders.");
+         CancelAllPendingOrders();
+      }
+   }
+   lastPositions = positions;
+
    if (positions > 0) {
       //--- Monitor current positions
       ModifyPositions();
    }
    
-   if (timeToTrade && positions < maxActiveTrades) {
-      //--- Only execute one position per bar
-      int bars = iBars(_Symbol, Timeframe);
-      
-      if (barsTotal != bars) {
-         barsTotal = bars;
+   bool isTimeToTrade = timeToTrade();
+   
+   if (isTimeToTrade) {
+      // Check if we've reached the maximum number of executed trades for this day
+      if (executedTradesToday >= MaxTradesPerDay) {
+         Comment("Maximum executed trades per day (", MaxTradesPerDay, ") reached. No more trades for this day.");
+      } else {
+         // Only execute one position per bar
+         int bars = iBars(_Symbol, Timeframe);
          
-         if(positions == 0 && orders == 0) {
-            TradeLogic();
+         if (barsTotal != bars) {
+            barsTotal = bars;
+            
+            if(positions == 0 && orders == 0) {
+               TradeLogic();
+            }
          }
       }
    }
    
-   if (AutoClosePositions && !timeToTrade && positions > 0) {
+   if (AutoClosePositions && !isTimeToTrade && positions > 0) {
       CloseAllPositions();
    }
    
@@ -122,12 +183,33 @@ void OnTick() {
 void TradeLogic() {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   TrendType currentTrend = determineTrend();
    
-   //--- Buy Conditions
-   //--- OnBuy();
-   
-   //--- Sell Conditions
-   //--- OnSell();
+   if (TradeWithTrend) {
+      // Trade with trend logic
+      bool trendingUp = currentTrend == Uptrend;
+      bool trendingDown = currentTrend == Downtrend;
+      
+      Print("Current trend: ", currentTrend, " (Uptrend: ", trendingUp, ", Downtrend: ", trendingDown, ")");
+      
+      // Only trade based on the current trend
+      if (trendingUp) {
+         //--- Buy Conditions
+         //--- OnBuy();
+      } else if (trendingDown) {
+         //--- Sell Conditions
+         //--- OnSell();
+      } else {
+         Print("No clear trend direction. No trade placed.");
+      }
+   } else {
+      // Trade without trend consideration
+      //--- Buy Conditions
+      //--- OnBuy();
+      
+      //--- Sell Conditions
+      //--- OnSell();
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -136,25 +218,65 @@ void TradeLogic() {
 //--- On Buy
 void OnBuy() {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double tp = ask + TpPoints * _Point;
-   double sl = ask - SlPoints * _Point;
+   double tp = 0;
+   double sl = 0;
+   
+   // Calculate TP
+   if (TpFactor > 0) {
+      // Use factor-based TP calculation (implement based on strategy needs)
+      tp = ask + TpPoints * _Point; // Default fallback
+   } else if (TpPoints > 0) {
+      tp = ask + TpPoints * _Point;
+   }
+   
+   // Calculate SL
+   if (SlFactor > 0) {
+      // Use factor-based SL calculation (implement based on strategy needs)
+      sl = ask - SlPoints * _Point; // Default fallback
+   } else if (SlPoints > 0) {
+      sl = ask - SlPoints * _Point;
+   }
    
    double lots = LotSize;
-   if(RiskPercent > 0) lots = calcLots(ask-sl);
+   if(RiskPercent > 0 && sl > 0) lots = calcLots(ask-sl);
    
-   trade.Buy(lots, _Symbol, ask, sl, tp);
+   if (trade.Buy(lots, _Symbol, ask, sl, tp)) {
+      Print("Buy Order executed: ", trade.ResultOrder());
+   } else {
+      Print("Buy Order failed: ", GetLastError());
+   }
 }
 
 //--- On Sell
 void OnSell() {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double tp = bid - TpPoints * _Point;
-   double sl = bid + SlPoints * _Point;
+   double tp = 0;
+   double sl = 0;
+   
+   // Calculate TP
+   if (TpFactor > 0) {
+      // Use factor-based TP calculation (implement based on strategy needs)
+      tp = bid - TpPoints * _Point; // Default fallback
+   } else if (TpPoints > 0) {
+      tp = bid - TpPoints * _Point;
+   }
+   
+   // Calculate SL
+   if (SlFactor > 0) {
+      // Use factor-based SL calculation (implement based on strategy needs)
+      sl = bid + SlPoints * _Point; // Default fallback
+   } else if (SlPoints > 0) {
+      sl = bid + SlPoints * _Point;
+   }
    
    double lots = LotSize;
-   if(RiskPercent > 0) lots = calcLots(sl-bid);
+   if(RiskPercent > 0 && sl > 0) lots = calcLots(sl-bid);
    
-   trade.Sell(lots, _Symbol, bid, sl, tp);
+   if (trade.Sell(lots, _Symbol, bid, sl, tp)) {
+      Print("Sell Order executed: ", trade.ResultOrder());
+   } else {
+      Print("Sell Order failed: ", GetLastError());
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -168,7 +290,7 @@ void ModifyPositions() {
       ulong posTicket = PositionGetTicket(i);
       
       if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
-      if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
         
       // Check if TSL is enabled - Fixed condition
       if (TslTriggerPoints != 0 || TslTriggerFactor != 0) {
@@ -230,17 +352,50 @@ void SetTrailingSL(double ask, double bid, ulong posTicket) {
 }
 
 void CloseAllPositions() {
-   for (int i=0; i < PositionsTotal(); i++) {
+   // Use a reverse loop to avoid issues when positions are closed
+   for (int i = PositionsTotal() - 1; i >= 0; i--) {
       ulong posTicket = PositionGetTicket(i);
       
-      if(!PositionSelectByTicket(posTicket)) continue; // Ensure position is selected
+      if(!PositionSelectByTicket(posTicket)) {
+         Print("Failed to select position at index: ", i);
+         continue;
+      }
       
       if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
-      if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
 
-      Print("Closing Ticket: ", posTicket);
+      Print("Attempting to close position Ticket: ", posTicket);
+      
+      // Check if position is still valid before closing
+      if(!PositionSelectByTicket(posTicket)) {
+         Print("Position ", posTicket, " no longer exists");
+         continue;
+      }
+      
       if(!trade.PositionClose(posTicket)) {
-         Print("Failed to close position: ", posTicket, " Error: ", GetLastError());
+         int error = GetLastError();
+         Print("Failed to close position: ", posTicket, " Error: ", error);
+         
+         // Handle specific errors
+         switch(error) {
+            case 4109: // ERR_TRADE_DISABLED
+               Print("Trading is disabled");
+               break;
+            case 4108: // ERR_MARKET_CLOSED
+               Print("Market is closed");
+               break;
+            case 4107: // ERR_INSUFFICIENT_MONEY
+               Print("Insufficient money to close position");
+               break;
+            case 4103: // ERR_POSITION_NOT_FOUND
+               Print("Position not found - may have been closed already");
+               break;
+            default:
+               Print("Unknown error occurred while closing position");
+               break;
+         }
+      } else {
+         Print("Successfully closed position: ", posTicket);
       }
    }
 }
@@ -286,7 +441,8 @@ bool timeToTrade() {
    Comment("\nServer Time: ", TimeCurrent(),
            "\nTime Start Dt: ", timeStart,
            "\nTime End Dt: ", timeEnd,
-           "\nTimeFilter: ", isTime);
+           "\nTimeFilter: ", isTime,
+           "\nExecuted Trades Today: ", executedTradesToday, "/", MaxTradesPerDay);
            
    return isTime;
 }
@@ -301,6 +457,13 @@ bool timeToClosePositions() {
    datetime timeEnd = StructToTime(structTime);
    
    bool isTime = TimeCurrent() >= timeEnd;
+   
+   // Add debugging information
+   if (isTime) {
+      Print("Position closing time reached - Current: ", TimeToString(TimeCurrent()), 
+            " Close time: ", TimeToString(timeEnd),
+            " Close hour: ", ClosePositionsHour, " Close minute: ", ClosePositionsMinute);
+   }
            
    return isTime;
 }
@@ -311,22 +474,64 @@ double calcLots(double slPoints){
    double tickvalue = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
    double lotstep = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
    
-   // Normalize slPoints to symbol point value for consistent calculation
-   double normalizedSlPoints = slPoints / _Point;
-   
-   double moneyPerLotstep = normalizedSlPoints / ticksize * tickvalue * lotstep;   
+   double moneyPerLotstep = slPoints / ticksize * tickvalue * lotstep;   
    double lots = MathFloor(risk / moneyPerLotstep) * lotstep;
 
    lots = MathMin(lots,SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX));
    lots = MathMax(lots,SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN));
    
-   // Debug information
-   Print("Lot Size Calculation - Symbol: ", _Symbol, 
-         ", Timeframe: ", EnumToString(Timeframe),
-         ", SL Points: ", slPoints,
-         ", Normalized SL Points: ", normalizedSlPoints,
-         ", Risk Amount: ", risk,
-         ", Calculated Lots: ", lots);
-   
    return lots;
+}
+
+TrendType determineTrend() {
+   double slowTrendMa[];
+   double fastTrendMa[];
+   CopyBuffer(handleSlowTrendMa, MAIN_LINE, 1,2, slowTrendMa);
+   CopyBuffer(handleFastTrendMa, MAIN_LINE, 1,2, fastTrendMa);   
+   
+   if (fastTrendMa[0] - RangeBuffer * _Point > slowTrendMa[0]) {
+      return Uptrend;
+   } else if (fastTrendMa[0] < slowTrendMa[0] - RangeBuffer * _Point) {
+      return Downtrend;
+   }
+   
+   return Ranging;
+}
+
+void CheckAndUpdateDay() {
+   MqlDateTime current;
+   TimeCurrent(current);
+   int today = current.day + current.mon * 100 + current.year * 10000;
+   
+   if (currentDay != today) {
+      currentDay = today;
+      executedTradesToday = 0;
+      Print("New day started. Executed trades reset to 0.");
+   }
+}
+
+void CancelAllPendingOrders() {
+   Print("Cancelling all pending orders after position execution...");
+   int cancelledCount = 0;
+   
+   // Use reverse loop to avoid issues when orders are cancelled
+   for (int i = OrdersTotal() - 1; i >= 0; i--) {
+      ulong orderTicket = OrderGetTicket(i);
+      
+      if (!OrderSelect(orderTicket)) continue;
+      
+      // Only cancel orders with our magic number and symbol
+      if (OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+      if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      
+      // Cancel the pending order
+      if (trade.OrderDelete(orderTicket)) {
+         Print("Cancelled pending order: ", orderTicket, " Type: ", OrderGetInteger(ORDER_TYPE));
+         cancelledCount++;
+      } else {
+         Print("Failed to cancel order: ", orderTicket, " Error: ", GetLastError());
+      }
+   }
+   
+   Print("Total pending orders cancelled: ", cancelledCount);
 } 
