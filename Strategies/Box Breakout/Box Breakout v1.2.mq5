@@ -9,8 +9,7 @@
 #property version   "1.20"
 
 //--- Imports
-#include <trade/trade.mqh>
-#include <Object.mqh>
+#include <Trade\Trade.mqh>
 
 //--- Custom Types
 enum TrendType {
@@ -43,7 +42,7 @@ input double TslPoints = 25; //TslPoints (0 = Breakeven)
 //--- Trend Settings
 input group "Trend Settings";
 input bool TradeWithTrend = true; //TradeWithTrend (Forces strategy to only trade with the trend)
-input ENUM_TIMEFRAMES TrendMaTimeframe = PERIOD_M6; //TrendMaTimeframe (The timeframe the trending moving average should be calculated)
+input ENUM_TIMEFRAMES TrendMaTimeframe = PERIOD_H1; //TrendMaTimeframe (The timeframe the trending moving average should be calculated)
 input ENUM_MA_METHOD SlowTrendMaMethod = MODE_SMA; //SlowTrendMaMethod (The type of moving average used to determine the slow trend)
 input int SlowTrendMaPeriod = 200; //SlowTrendMaPeriod (The period used to calculate the slow trending moving average)
 input ENUM_MA_METHOD FastTrendMaMethod = MODE_SMMA; //FastTrendMaMethod (The type of moving average used to determine the fast trend)
@@ -62,12 +61,13 @@ input int StopTradingHour = 17;
 input int StopTradingMinute = 30;
 input int ClosePositionsHour = 19;
 input int ClosePositionsMinute = 55;
+input int MaxTradesPerDay = 1; //MaxTradesPerDay (Maximum number of executed trades per day - EA cancels remaining orders when limit reached)
 
 //+------------------------------------------------------------------+
 //| Class Definitions                                                |
 //+------------------------------------------------------------------+
 
-class CRange : public CObject {
+class CRange {
 public:
    datetime timeStart;
    datetime timeEnd;
@@ -78,7 +78,10 @@ public:
    bool sellPlaced;
    TrendType sessionTrend;
    bool timeToTrade;
-   CRange(int ds) { dayShift = ds; }
+   int tradesCount; // Track number of trades made in this session
+   int currentDay; // Track current day for trade counting
+   int executedTradesToday; // Track executed trades per day
+   CRange(int ds) { dayShift = ds; tradesCount = 0; currentDay = 0; executedTradesToday = 0; }
    
    void commentRange() {
       Comment("\nRange Start: ", timeStart,
@@ -86,7 +89,8 @@ public:
               "\nRange High: ", high,
               "\nRange Low: ", low,
               "\nSession Trend: ", sessionTrend,
-              "\nTime to Trade: ", timeToTrade
+              "\nTime to Trade: ", timeToTrade,
+              "\nExecuted Trades Today: ", executedTradesToday, "/", MaxTradesPerDay
               );
    }
    
@@ -137,16 +141,16 @@ public:
       string objName = MQLInfoString(MQL_PROGRAM_NAME) + " " + TimeToString(timeStart); 
       
       //--- Paint the range
-      ObjectCreate(0, "Range - " + structTime.day + structTime.year, OBJ_RECTANGLE, 0, timeStart, low, timeEnd, high);
-      ObjectSetInteger(0, "Range - " + structTime.day + structTime.year, OBJPROP_FILL, true);
+      ObjectCreate(0, "Range - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJ_RECTANGLE, 0, timeStart, low, timeEnd, high);
+      ObjectSetInteger(0, "Range - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJPROP_FILL, true);
       
       //--- Paint the trading time
       structTime.hour = ClosePositionsHour;
-      structTime.min = ClosePositionsHour;
+      structTime.min = ClosePositionsMinute;
       datetime tradingEnd = StructToTime(structTime);
       
-      ObjectCreate(0, "Trading Period High - " + structTime.day + structTime.year, OBJ_RECTANGLE, 0, timeStart, high, tradingEnd, high);
-      ObjectCreate(0, "Trading Period Low - " + structTime.day + structTime.year, OBJ_RECTANGLE, 0, timeStart, low, tradingEnd, low);
+      ObjectCreate(0, "Trading Period High - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJ_RECTANGLE, 0, timeStart, high, tradingEnd, high);
+      ObjectCreate(0, "Trading Period Low - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJ_RECTANGLE, 0, timeStart, low, tradingEnd, low);
    }
 };
 
@@ -163,6 +167,9 @@ int handleFastTrendMa;
 //+------------------------------------------------------------------+
 
 int OnInit() {   
+   // Initialize trade object with magic number
+   trade.SetExpertMagicNumber(Magic);
+   
    handleSlowTrendMa = iMA(_Symbol, TrendMaTimeframe, SlowTrendMaPeriod, 0, SlowTrendMaMethod, PRICE_CLOSE);
    handleFastTrendMa = iMA(_Symbol, TrendMaTimeframe, FastTrendMaPeriod, 0, FastTrendMaMethod, PRICE_CLOSE);
    
@@ -174,6 +181,18 @@ int OnInit() {
    
    activeRange.buyPlaced = false;
    activeRange.sellPlaced = false;
+   
+   // Initialize day counter
+   CheckAndUpdateDay();
+   
+   // Debug time information on startup
+   Print("=== EA Initialization ===");
+   DebugTimeInfo();
+   Print("Magic Number: ", Magic);
+   Print("Close Positions Time: ", ClosePositionsHour, ":", ClosePositionsMinute);
+   Print("Max Trades Per Day: ", MaxTradesPerDay);
+   Print("Trade With Trend: ", TradeWithTrend);
+   Print("========================");
   
    return(INIT_SUCCEEDED);
 }
@@ -186,6 +205,24 @@ void OnTick() {
    int positions = PositionsTotalByMagic(Magic);
    int orders = OrdersTotalByMagic(Magic);
 
+   // Check and update day counter
+   CheckAndUpdateDay();
+
+   // Check if a new position was opened (order executed)
+   static int lastPositions = 0;
+   if (positions > lastPositions) {
+      // New position opened - increment executed trades counter
+      activeRange.executedTradesToday++;
+      Print("Position opened! Executed trades today: ", activeRange.executedTradesToday, "/", MaxTradesPerDay);
+      
+      // Cancel all remaining pending orders when we've reached the daily limit
+      if (activeRange.executedTradesToday >= MaxTradesPerDay) {
+         Print("Daily trade limit reached (", MaxTradesPerDay, "). Cancelling all remaining pending orders.");
+         CancelAllPendingOrders();
+      }
+   }
+   lastPositions = positions;
+
    if (positions > 0) {
       //--- Monitor current positions
       ModifyPositions();
@@ -193,29 +230,44 @@ void OnTick() {
 
    activeRange.commentRange();
    
+   // Check if we need to calculate the range
+   bool rangeCalculated = false;
    if (timeToCalculateRange()){
       activeRange.calculateRange();
       activeRange.drawRect();
+      rangeCalculated = true;
+      // Reset order placement flags when new range is calculated
+      activeRange.buyPlaced = false;
+      activeRange.sellPlaced = false;
+      // Reset trade count for new session
+      activeRange.tradesCount = 0;
+      Print("New session started. Trade count reset to 0.");
    }
    
+   // Check if we're in trading time
    if (timeToTrade()) {
-      activeRange.calculateRange();
-      activeRange.drawRect();
       activeRange.timeToTrade = true;
       
-      if(positions == 0 && orders == 0) {
-         TradeLogic();  
+      // If range was just calculated or we don't have orders yet, try to place orders
+      if (rangeCalculated || (positions == 0 && orders == 0)) {
+         if(positions == 0 && orders == 0) {
+            TradeLogic();  
+         }
       }
    } else {
       activeRange.timeToTrade = false;
    }
    
-   if (timeToClosePositions()) {
-      //-- Close all positions
-     
-      CloseAllPositions();
-      activeRange.sellPlaced = false;
-      activeRange.buyPlaced = false;
+   // Add debugging for position closing
+   if (positions > 0) {
+      bool shouldClose = timeToClosePositions();
+      if (shouldClose) {
+         Print("Time to close positions triggered - Current time: ", TimeToString(TimeCurrent()), 
+               " Close time: ", ClosePositionsHour, ":", ClosePositionsMinute);
+         CloseAllPositions();
+         activeRange.sellPlaced = false;
+         activeRange.buyPlaced = false;
+      }
    }
 }
 
@@ -237,26 +289,52 @@ breakouts in the london and ny sessions
 */
 
 void TradeLogic() {   
+   // Check if we've reached the maximum number of executed trades for this day
+   if (activeRange.executedTradesToday >= MaxTradesPerDay) {
+      Print("Maximum executed trades per day (", MaxTradesPerDay, ") reached. No more trades for this day.");
+      return;
+   }
+   
    double ask = SymbolInfoDouble(NULL, SYMBOL_ASK);
    double bid = SymbolInfoDouble(NULL, SYMBOL_BID);
-   activeRange.sessionTrend = determineTrend();
+   TrendType currentTrend = determineTrend();
    
-   bool trendingUp = true;
-   bool trendingDown = true;
+   // Log trend change if it's different from the stored trend
+   if (activeRange.sessionTrend != currentTrend) {
+      Print("Trend changed from ", activeRange.sessionTrend, " to ", currentTrend);
+   }
+   activeRange.sessionTrend = currentTrend;
    
    if (TradeWithTrend) {
-      trendingUp = activeRange.sessionTrend == Uptrend;
-      trendingDown = activeRange.sessionTrend == Downtrend;
-   }
-   
-   
-   //--- Buy when price goes above range high
-   if (trendingUp && !activeRange.buyPlaced) {
-      OnBuy();
-   }
-   
-   if (trendingDown && !activeRange.sellPlaced) {
-      OnSell();
+      // Trade with trend logic - place only one order based on trend
+      bool trendingUp = activeRange.sessionTrend == Uptrend;
+      bool trendingDown = activeRange.sessionTrend == Downtrend;
+      
+      Print("Current trend: ", activeRange.sessionTrend, " (Uptrend: ", trendingUp, ", Downtrend: ", trendingDown, ")");
+      
+      // Only place one trade based on the current trend
+      if (trendingUp && !activeRange.buyPlaced) {
+         Print("Placing BUY order based on uptrend");
+         OnBuy();
+      } else if (trendingDown && !activeRange.sellPlaced) {
+         Print("Placing SELL order based on downtrend");
+         OnSell();
+      } else {
+         Print("No clear trend direction or order already placed. No trade placed.");
+      }
+   } else {
+      // Trade without trend - place both orders
+      // Remaining orders will be cancelled when MaxTradesPerDay limit is reached
+      Print("Trading without trend - placing both buy and sell orders");
+      Print("Orders will be cancelled when daily limit (", MaxTradesPerDay, ") is reached");
+      
+      if (!activeRange.buyPlaced) {
+         OnBuy();
+      }
+      
+      if (!activeRange.sellPlaced) {
+         OnSell();
+      }
    }
 }
 
@@ -290,6 +368,16 @@ void OnBuy() {
    if (trade.BuyStop(lots, activeRange.high, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, cancelAt)) {
       Print("Buy Order: ", trade.ResultOrder());
       activeRange.buyPlaced = true;
+      // Don't increment trade count here - only count executed trades
+      Print("Buy order placed. Waiting for execution.");
+      
+      // Create descriptive comment for the order
+      string tradeComment = "Buy Stop above range high " + 
+                           DoubleToString(activeRange.high, _Digits) + " (Range: " + DoubleToString(activeRange.low, _Digits) + 
+                           " - " + DoubleToString(activeRange.high, _Digits) + ")";
+      Print(tradeComment);
+   } else {
+      Print("Buy Order failed: ", GetLastError());
    }
 }
 
@@ -319,6 +407,16 @@ void OnSell() {
    if (trade.SellStop(lots, activeRange.low, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, cancelAt)) {
       Print("Sell Order: ", trade.ResultOrder());
       activeRange.sellPlaced = true;
+      // Don't increment trade count here - only count executed trades
+      Print("Sell order placed. Waiting for execution.");
+      
+      // Create descriptive comment for the order
+      string tradeComment = "Sell Stop below range low " + 
+                           DoubleToString(activeRange.low, _Digits) + " (Range: " + DoubleToString(activeRange.low, _Digits) + 
+                           " - " + DoubleToString(activeRange.high, _Digits) + ")";
+      Print(tradeComment);
+   } else {
+      Print("Sell Order failed: ", GetLastError());
    }
 }
 
@@ -333,7 +431,7 @@ void ModifyPositions() {
       ulong posTicket = PositionGetTicket(i);
       
       if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
-      if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
 
       // Check if TSL is enabled - Fixed condition
       if (TslTriggerPoints != 0 || TslTriggerFactor != 0) {
@@ -442,22 +540,11 @@ double calcLots(double slPoints){
    double tickvalue = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
    double lotstep = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
    
-   // Normalize slPoints to symbol point value for consistent calculation
-   double normalizedSlPoints = slPoints / _Point;
-   
-   double moneyPerLotstep = normalizedSlPoints / ticksize * tickvalue * lotstep;   
+   double moneyPerLotstep = slPoints / ticksize * tickvalue * lotstep;   
    double lots = MathFloor(risk / moneyPerLotstep) * lotstep;
 
    lots = MathMin(lots,SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX));
    lots = MathMax(lots,SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN));
-   
-   // Debug information
-   Print("Lot Size Calculation - Symbol: ", _Symbol, 
-         ", Timeframe: ", EnumToString(Timeframe),
-         ", SL Points: ", slPoints,
-         ", Normalized SL Points: ", normalizedSlPoints,
-         ", Risk Amount: ", risk,
-         ", Calculated Lots: ", lots);
    
    return lots;
 }
@@ -490,22 +577,62 @@ bool timeToClosePositions() {
    datetime timeEnd = StructToTime(structTime);
    
    bool isTime = TimeCurrent() >= timeEnd;
+   
+   // Add debugging information
+   if (isTime) {
+      Print("Position closing time reached - Current: ", TimeToString(TimeCurrent()), 
+            " Close time: ", TimeToString(timeEnd),
+            " Close hour: ", ClosePositionsHour, " Close minute: ", ClosePositionsMinute);
+   }
            
    return isTime;
 }
 
 void CloseAllPositions() {
-   for (int i=0; i < PositionsTotal(); i++) {
+   // Use a reverse loop to avoid issues when positions are closed
+   for (int i = PositionsTotal() - 1; i >= 0; i--) {
       ulong posTicket = PositionGetTicket(i);
       
-      if(!PositionSelectByTicket(posTicket)) continue; // Ensure position is selected
+      if(!PositionSelectByTicket(posTicket)) {
+         Print("Failed to select position at index: ", i);
+         continue;
+      }
       
       if (PositionGetInteger(POSITION_MAGIC) != Magic) continue; //--- Don't check the position of other EAs
-      if (PositionGetSymbol(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue; //--- Don't change position if chart changes
 
-      Print("Closing Ticket: ", posTicket);
+      Print("Attempting to close position Ticket: ", posTicket);
+      
+      // Check if position is still valid before closing
+      if(!PositionSelectByTicket(posTicket)) {
+         Print("Position ", posTicket, " no longer exists");
+         continue;
+      }
+      
       if(!trade.PositionClose(posTicket)) {
-         Print("Failed to close position: ", posTicket, " Error: ", GetLastError());
+         int error = GetLastError();
+         Print("Failed to close position: ", posTicket, " Error: ", error);
+         
+         // Handle specific errors
+         switch(error) {
+            case 4109: // ERR_TRADE_DISABLED
+               Print("Trading is disabled");
+               break;
+            case 4108: // ERR_MARKET_CLOSED
+               Print("Market is closed");
+               break;
+            case 4107: // ERR_INSUFFICIENT_MONEY
+               Print("Insufficient money to close position");
+               break;
+            case 4103: // ERR_POSITION_NOT_FOUND
+               Print("Position not found - may have been closed already");
+               break;
+            default:
+               Print("Unknown error occurred while closing position");
+               break;
+         }
+      } else {
+         Print("Successfully closed position: ", posTicket);
       }
    }
 }
@@ -525,3 +652,58 @@ TrendType determineTrend() {
    return Ranging;
 }
 
+// Helper function to debug time calculations
+void DebugTimeInfo() {
+   MqlDateTime current;
+   TimeCurrent(current);
+   
+   Print("Current time: ", TimeToString(TimeCurrent()),
+         " Day of week: ", current.day_of_week,
+         " Hour: ", current.hour,
+         " Minute: ", current.min);
+         
+   Print("Close positions time: ", ClosePositionsHour, ":", ClosePositionsMinute);
+   Print("Time to close positions: ", timeToClosePositions());
+}
+
+void CheckAndUpdateDay() {
+   MqlDateTime current;
+   TimeCurrent(current);
+   int today = current.day + current.mon * 100 + current.year * 10000;
+   
+   if (activeRange.currentDay != today) {
+      activeRange.currentDay = today;
+      activeRange.executedTradesToday = 0;
+      Print("New day started. Executed trades reset to 0.");
+   }
+}
+
+void CancelAllPendingOrders() {
+   Print("Cancelling all pending orders after position execution...");
+   int cancelledCount = 0;
+   
+   // Use reverse loop to avoid issues when orders are cancelled
+   for (int i = OrdersTotal() - 1; i >= 0; i--) {
+      ulong orderTicket = OrderGetTicket(i);
+      
+      if (!OrderSelect(orderTicket)) continue;
+      
+      // Only cancel orders with our magic number and symbol
+      if (OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+      if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      
+      // Cancel the pending order
+      if (trade.OrderDelete(orderTicket)) {
+         Print("Cancelled pending order: ", orderTicket, " Type: ", OrderGetInteger(ORDER_TYPE));
+         cancelledCount++;
+      } else {
+         Print("Failed to cancel order: ", orderTicket, " Error: ", GetLastError());
+      }
+   }
+   
+   Print("Total pending orders cancelled: ", cancelledCount);
+   
+   // Reset the order placement flags since orders are cancelled
+   activeRange.buyPlaced = false;
+   activeRange.sellPlaced = false;
+}
