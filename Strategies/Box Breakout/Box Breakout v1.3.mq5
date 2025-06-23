@@ -6,7 +6,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Jerry Zhou."
 #property link      "https://www.jerryzhou.xyz/"
-#property version   "1.20"
+#property version   "1.30"
 
 //--- Imports
 #include <Trade\Trade.mqh>
@@ -53,6 +53,7 @@ input double RangeBuffer = 0; //RangeBuffer (Amount in points between the two mo
 //| Strategy Specific Inputs                                         |
 //+------------------------------------------------------------------+
 input group "Strategy Inputs";
+input ENUM_TIMEFRAMES RangeTimeframe = PERIOD_M5; //RangeTimeframe (Fixed timeframe for consistent range calculation)
 input int RangeStartHour = 3;
 input int RangeStartMinute = 0;
 input int RangeEndHour = 7;
@@ -62,6 +63,8 @@ input int StopTradingMinute = 30;
 input int ClosePositionsHour = 19;
 input int ClosePositionsMinute = 55;
 input int MaxTradesPerDay = 1; //MaxTradesPerDay (Maximum number of executed trades per day - EA cancels remaining orders when limit reached)
+input int HistoricalDays = 30; //HistoricalDays (Number of past days to display ranges for - maximum 50)
+input bool ShowAllTradingLines = true; //ShowAllTradingLines (Show trading window lines for all historical ranges)
 
 //+------------------------------------------------------------------+
 //| Class Definitions                                                |
@@ -81,7 +84,23 @@ public:
    int tradesCount; // Track number of trades made in this session
    int currentDay; // Track current day for trade counting
    int executedTradesToday; // Track executed trades per day
-   CRange(int ds) { dayShift = ds; tradesCount = 0; currentDay = 0; executedTradesToday = 0; }
+   bool rangeCalculated; // Flag to prevent re-calculation of same range
+   datetime lastCalculationDate; // Track when range was last calculated
+   bool validRange; // Flag to indicate if range calculation was successful
+   
+   CRange(int ds) { 
+      dayShift = ds; 
+      tradesCount = 0; 
+      currentDay = 0; 
+      executedTradesToday = 0; 
+      rangeCalculated = false; 
+      lastCalculationDate = 0; 
+      validRange = false;
+      high = 0;
+      low = 0;
+      timeStart = 0;
+      timeEnd = 0;
+   }
    
    void commentRange() {
       Comment("\nRange Start: ", timeStart,
@@ -94,63 +113,237 @@ public:
               );
    }
    
-   void calculateRange() {
+   bool calculateRange() {
+      //--- Calculate the target date for this range
+      datetime targetDate = TimeCurrent() - dayShift * 24 * 3600; // Subtract days in seconds
       MqlDateTime structTime;
-      MqlDateTime currentTime;
-      TimeCurrent(structTime);
-      TimeCurrent(currentTime);
-      structTime.day = structTime.day - dayShift;
-      currentTime.day = currentTime.day - dayShift;
+      TimeToStruct(targetDate, structTime);
       
-      //--- skip if its a Saturday or Sunday
-      if (structTime.day_of_week == 6 || structTime.day_of_week == 0) return; 
-      
-      structTime.sec = 0;
-      
-      structTime.hour = RangeStartHour;
-      structTime.min = RangeStartMinute;
-      timeStart = StructToTime(structTime);
-      
-      if (currentTime.hour < RangeEndHour && dayShift == 0) {
-         structTime.hour = currentTime.hour;
-         structTime.min = currentTime.min;
-      } else {
-         structTime.hour = RangeEndHour;
-         structTime.min = RangeEndMinute;
+      //--- Check if we already calculated this range today (prevent unnecessary re-calculations)
+      datetime todayDate = targetDate - (targetDate % (24 * 3600)); // Get start of day
+      if (rangeCalculated && lastCalculationDate == todayDate && dayShift > 0) {
+         // Already calculated this historical range for today
+         return validRange;
       }
       
-      timeEnd = StructToTime(structTime);   
+      //--- Skip weekends - check day_of_week after adjusting the date
+      if (structTime.day_of_week == 6 || structTime.day_of_week == 0) {
+         if (dayShift <= 5) { // Only print for recent days to avoid spam
+            Print("Skipping range calculation for weekend day: ", structTime.day_of_week, " (", TimeToString(targetDate), ")");
+         }
+         validRange = false;
+         return false; 
+      }
       
-      //--- Find high and low within range
-      int start_shift = iBarShift(_Symbol, Timeframe, timeStart);
-      int end_shift = iBarShift(_Symbol, Timeframe, timeEnd);
-      int barCount = start_shift - end_shift;
+      //--- Set range start time
+      structTime.hour = RangeStartHour;
+      structTime.min = RangeStartMinute;
+      structTime.sec = 0;
+      timeStart = StructToTime(structTime);
       
-      int highestBar = iHighest(_Symbol, Timeframe, MODE_HIGH, barCount, end_shift);
-      int lowestBar = iLowest(_Symbol, Timeframe, MODE_LOW, barCount, end_shift);
-      high = iHigh(_Symbol, Timeframe, highestBar);
-      low = iLow(_Symbol, Timeframe, lowestBar);    
+      //--- Set range end time
+      structTime.hour = RangeEndHour;
+      structTime.min = RangeEndMinute;
+      timeEnd = StructToTime(structTime);
+      
+      //--- For current day (dayShift = 0), limit end time to current time if we're still in range period
+      if (dayShift == 0) {
+         datetime currentTime = TimeCurrent();
+         if (currentTime < timeEnd) {
+            timeEnd = currentTime;
+         }
+      }
+      
+      //--- Validate time range
+      if (timeStart >= timeEnd) {
+         if (dayShift <= 5) { // Only print for recent days
+            Print("Warning: Invalid time range for day ", dayShift, " - Start: ", TimeToString(timeStart), " End: ", TimeToString(timeEnd));
+         }
+         validRange = false;
+         return false;
+      }
+      
+      //--- Check if we have sufficient historical data
+      int testShift = iBarShift(_Symbol, RangeTimeframe, timeStart);
+      if (testShift == -1) {
+         if (dayShift <= 5) { // Only print for recent days
+            Print("Warning: No historical data available for day ", dayShift, " - Date: ", TimeToString(timeStart));
+         }
+         validRange = false;
+         return false;
+      }
+      
+      //--- Find high and low within range using standardized timeframe
+      int start_shift = iBarShift(_Symbol, RangeTimeframe, timeStart);
+      int end_shift = iBarShift(_Symbol, RangeTimeframe, timeEnd);
+      
+      //--- Ensure we have valid bar shifts
+      if (start_shift == -1 || end_shift == -1) {
+         if (dayShift <= 5) { // Only print for recent days
+            Print("Warning: Invalid bar shift detected for day ", dayShift, 
+                  " timeStart=", TimeToString(timeStart), 
+                  " timeEnd=", TimeToString(timeEnd),
+                  " start_shift=", start_shift, " end_shift=", end_shift);
+         }
+         validRange = false;
+         return false;
+      }
+      
+      //--- Calculate bar count (start_shift is older, end_shift is newer)
+      int barCount = start_shift - end_shift + 1;
+      
+      //--- Ensure we have at least one bar to analyze
+      if (barCount <= 0) {
+         if (dayShift <= 5) { // Only print for recent days
+            Print("Warning: Invalid bar count for day ", dayShift, ": ", barCount, " start_shift=", start_shift, " end_shift=", end_shift);
+         }
+         validRange = false;
+         return false;
+      }
+      
+      //--- Find highest and lowest bars within the range
+      int highestBar = iHighest(_Symbol, RangeTimeframe, MODE_HIGH, barCount, end_shift);
+      int lowestBar = iLowest(_Symbol, RangeTimeframe, MODE_LOW, barCount, end_shift);
+      
+      //--- Validate the results
+      if (highestBar == -1 || lowestBar == -1) {
+         if (dayShift <= 5) { // Only print for recent days
+            Print("Warning: Failed to find highest/lowest bars for day ", dayShift, 
+                  ". barCount=", barCount, " end_shift=", end_shift);
+         }
+         validRange = false;
+         return false;
+      }
+      
+      //--- Get the actual high and low values
+      double newHigh = iHigh(_Symbol, RangeTimeframe, highestBar);
+      double newLow = iLow(_Symbol, RangeTimeframe, lowestBar);
+      
+      //--- Validate price data
+      if (newHigh <= 0 || newLow <= 0 || newHigh <= newLow) {
+         if (dayShift <= 5) { // Only print for recent days
+            Print("Warning: Invalid price data for day ", dayShift, ". High: ", newHigh, " Low: ", newLow);
+         }
+         validRange = false;
+         return false;
+      }
+      
+      //--- Update range values
+      high = newHigh;
+      low = newLow;
+      rangeCalculated = true;
+      lastCalculationDate = todayDate;
+      validRange = true;
+      
+      //--- Debug information for range calculation (only for recent days or current day)
+      if (dayShift <= 2) {
+         Print("Day ", dayShift, " range calculated using ", EnumToString(RangeTimeframe), 
+               " - Start: ", TimeToString(timeStart), 
+               " End: ", TimeToString(timeEnd),
+               " Bars analyzed: ", barCount,
+               " High: ", DoubleToString(high, _Digits),
+               " Low: ", DoubleToString(low, _Digits),
+               " Range size: ", DoubleToString(high - low, _Digits), " points");
+      }
+      
+      return true;
    }
    
    void drawRect() {
+      //--- Only draw if we have valid range data
+      if (!validRange || high <= 0 || low <= 0 || high <= low || timeStart >= timeEnd) {
+         return; // Silently skip invalid ranges
+      }
+      
+      //--- Get the date for this range
       MqlDateTime structTime;
-      TimeCurrent(structTime);
-      structTime.day = structTime.day - dayShift;
-      structTime.sec = 0;
+      TimeToStruct(timeStart, structTime); // Use timeStart instead of current time
       
-      string objName = MQLInfoString(MQL_PROGRAM_NAME) + " " + TimeToString(timeStart); 
+      //--- Create unique object names using the actual range date
+      string dateStr = IntegerToString(structTime.year) + "_" + 
+                      StringFormat("%02d", structTime.mon) + "_" + 
+                      StringFormat("%02d", structTime.day);
       
-      //--- Paint the range
-      ObjectCreate(0, "Range - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJ_RECTANGLE, 0, timeStart, low, timeEnd, high);
-      ObjectSetInteger(0, "Range - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJPROP_FILL, true);
+      string rangeObjName = "Range_" + dateStr + "_" + IntegerToString(dayShift);
+      string highObjName = "Trading_High_" + dateStr + "_" + IntegerToString(dayShift);
+      string lowObjName = "Trading_Low_" + dateStr + "_" + IntegerToString(dayShift);
       
-      //--- Paint the trading time
-      structTime.hour = ClosePositionsHour;
-      structTime.min = ClosePositionsMinute;
-      datetime tradingEnd = StructToTime(structTime);
+      //--- Delete existing objects first
+      ObjectDelete(0, rangeObjName);
+      ObjectDelete(0, highObjName);
+      ObjectDelete(0, lowObjName);
       
-      ObjectCreate(0, "Trading Period High - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJ_RECTANGLE, 0, timeStart, high, tradingEnd, high);
-      ObjectCreate(0, "Trading Period Low - " + IntegerToString(structTime.day) + IntegerToString(structTime.year), OBJ_RECTANGLE, 0, timeStart, low, tradingEnd, low);
+      //--- Choose colors based on age (newer = more opaque)
+      color rangeColor = clrLightGray;
+      color highColor = clrRed;
+      color lowColor = clrBlue;
+      
+      // Make older ranges more transparent
+      if (dayShift > 7) {
+         rangeColor = clrSilver;
+         highColor = clrLightCoral;
+         lowColor = clrLightSteelBlue;
+      }
+      if (dayShift > 14) {
+         rangeColor = clrGainsboro;
+         highColor = clrMistyRose;
+         lowColor = clrAliceBlue;
+      }
+      
+      //--- Paint the range box
+      if (ObjectCreate(0, rangeObjName, OBJ_RECTANGLE, 0, timeStart, low, timeEnd, high)) {
+         ObjectSetInteger(0, rangeObjName, OBJPROP_FILL, true);
+         ObjectSetInteger(0, rangeObjName, OBJPROP_COLOR, rangeColor);
+         ObjectSetInteger(0, rangeObjName, OBJPROP_STYLE, STYLE_SOLID);
+         ObjectSetInteger(0, rangeObjName, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, rangeObjName, OBJPROP_BACK, true); // Draw in background
+         ObjectSetString(0, rangeObjName, OBJPROP_TOOLTIP, 
+                        "Range " + IntegerToString(dayShift) + " days ago\n" +
+                        "Date: " + TimeToString(timeStart, TIME_DATE) + "\n" +
+                        "High: " + DoubleToString(high, _Digits) + "\n" +
+                        "Low: " + DoubleToString(low, _Digits) + "\n" +
+                        "Size: " + DoubleToString(high - low, _Digits) + " points");
+      }
+      
+      //--- Calculate trading period end time
+      MqlDateTime tradingTime;
+      TimeToStruct(timeStart, tradingTime); // Use the same date as range
+      tradingTime.hour = ClosePositionsHour;
+      tradingTime.min = ClosePositionsMinute;
+      tradingTime.sec = 0;
+      datetime tradingEnd = StructToTime(tradingTime);
+      
+      //--- Paint the trading period high and low lines 
+      bool shouldDrawLines = ShowAllTradingLines || dayShift <= 5;
+      
+      if (shouldDrawLines) {
+         //--- Adjust line width and style based on age
+         int lineWidth = (dayShift <= 5) ? 2 : 1; // Thicker lines for recent ranges
+         ENUM_LINE_STYLE lineStyle = (dayShift <= 10) ? STYLE_SOLID : STYLE_DOT; // Dotted lines for older ranges
+         
+         if (ObjectCreate(0, highObjName, OBJ_RECTANGLE, 0, timeEnd, high, tradingEnd, high)) {
+            ObjectSetInteger(0, highObjName, OBJPROP_COLOR, highColor);
+            ObjectSetInteger(0, highObjName, OBJPROP_STYLE, lineStyle);
+            ObjectSetInteger(0, highObjName, OBJPROP_WIDTH, lineWidth);
+            ObjectSetString(0, highObjName, OBJPROP_TOOLTIP, 
+                           "Range High (" + IntegerToString(dayShift) + " days ago): " + DoubleToString(high, _Digits) + 
+                           "\nDate: " + TimeToString(timeStart, TIME_DATE));
+         }
+         
+         if (ObjectCreate(0, lowObjName, OBJ_RECTANGLE, 0, timeEnd, low, tradingEnd, low)) {
+            ObjectSetInteger(0, lowObjName, OBJPROP_COLOR, lowColor);
+            ObjectSetInteger(0, lowObjName, OBJPROP_STYLE, lineStyle);
+            ObjectSetInteger(0, lowObjName, OBJPROP_WIDTH, lineWidth);
+            ObjectSetString(0, lowObjName, OBJPROP_TOOLTIP, 
+                           "Range Low (" + IntegerToString(dayShift) + " days ago): " + DoubleToString(low, _Digits) + 
+                           "\nDate: " + TimeToString(timeStart, TIME_DATE));
+         }
+      }
+      
+      // Only print for recent ranges to avoid log spam
+      if (dayShift <= 2) {
+         Print("Range drawn for day ", dayShift, " - Objects: ", rangeObjName);
+      }
    }
 };
 
@@ -159,6 +352,7 @@ public:
 //+------------------------------------------------------------------+
 CTrade trade;
 CRange activeRange(0);
+CRange* historicalRanges[];
 int handleSlowTrendMa;
 int handleFastTrendMa;
 
@@ -170,17 +364,55 @@ int OnInit() {
    // Initialize trade object with magic number
    trade.SetExpertMagicNumber(Magic);
    
+   // Validate input parameters
+   int maxDays = MathMin(HistoricalDays, 50); // Limit to 50 days max
+   if (maxDays != HistoricalDays) {
+      Print("Historical days limited to maximum of 50. Using: ", maxDays);
+   }
+   
    handleSlowTrendMa = iMA(_Symbol, TrendMaTimeframe, SlowTrendMaPeriod, 0, SlowTrendMaMethod, PRICE_CLOSE);
    handleFastTrendMa = iMA(_Symbol, TrendMaTimeframe, FastTrendMaPeriod, 0, FastTrendMaMethod, PRICE_CLOSE);
    
-   for (int i = 1; i < 5; i++) {
-      CRange range(i);
-      range.calculateRange();
-      range.drawRect();
+   // Initialize historical ranges array
+   ArrayResize(historicalRanges, maxDays);
+   
+   // Calculate and draw historical ranges
+   Print("Calculating historical ranges for ", maxDays, " days...");
+   int validRanges = 0;
+   
+   for (int i = 1; i <= maxDays; i++) {
+      historicalRanges[i-1] = new CRange(i);
+      if (historicalRanges[i-1].calculateRange()) {
+         historicalRanges[i-1].drawRect();
+         validRanges++;
+      }
+      
+      // Add a small delay to prevent overwhelming the system
+      if (i % 10 == 0) {
+         Print("Processed ", i, " days, valid ranges: ", validRanges);
+         Sleep(10); // Small delay every 10 ranges
+      }
    }
    
+   Print("Historical range calculation complete. Valid ranges: ", validRanges, "/", maxDays);
+   
+   // Initialize current day range (dayShift = 0)
+   Print("Initializing current day range...");
    activeRange.buyPlaced = false;
    activeRange.sellPlaced = false;
+   
+   // Try to calculate current day range if we're in the range period
+   if (timeToCalculateRange()) {
+      Print("Current time is within range calculation period. Calculating current day range...");
+      if (activeRange.calculateRange()) {
+         activeRange.drawRect();
+         Print("Current day range successfully calculated and drawn.");
+      } else {
+         Print("Failed to calculate current day range.");
+      }
+   } else {
+      Print("Current time is outside range calculation period.");
+   }
    
    // Initialize day counter
    CheckAndUpdateDay();
@@ -189,8 +421,12 @@ int OnInit() {
    Print("=== EA Initialization ===");
    DebugTimeInfo();
    Print("Magic Number: ", Magic);
+   Print("Chart Timeframe: ", EnumToString(Timeframe));
+   Print("Range Calculation Timeframe: ", EnumToString(RangeTimeframe));
+   Print("Range Time: ", RangeStartHour, ":", StringFormat("%02d", RangeStartMinute), " - ", RangeEndHour, ":", StringFormat("%02d", RangeEndMinute));
    Print("Close Positions Time: ", ClosePositionsHour, ":", ClosePositionsMinute);
    Print("Max Trades Per Day: ", MaxTradesPerDay);
+   Print("Historical Days: ", maxDays);
    Print("Trade With Trend: ", TradeWithTrend);
    Print("========================");
   
@@ -198,7 +434,18 @@ int OnInit() {
 }
 
 void OnDeinit(const int reason) {
-
+   // Clean up historical ranges
+   for (int i = 0; i < ArraySize(historicalRanges); i++) {
+      if (CheckPointer(historicalRanges[i]) != POINTER_INVALID) {
+         delete historicalRanges[i];
+      }
+   }
+   ArrayFree(historicalRanges);
+   
+   // Clean up chart objects
+   CleanupObjects();
+   
+   Print("EA deinitialized. Reason: ", reason);
 }
 
 void OnTick() {
@@ -230,18 +477,74 @@ void OnTick() {
 
    activeRange.commentRange();
    
-   // Check if we need to calculate the range
+   // Check if we need to calculate the range (only once per session)
    bool rangeCalculated = false;
-   if (timeToCalculateRange()){
-      activeRange.calculateRange();
-      activeRange.drawRect();
-      rangeCalculated = true;
-      // Reset order placement flags when new range is calculated
-      activeRange.buyPlaced = false;
-      activeRange.sellPlaced = false;
-      // Reset trade count for new session
-      activeRange.tradesCount = 0;
-      Print("New session started. Trade count reset to 0.");
+   if (timeToCalculateRange() && !activeRange.rangeCalculated){
+      Print("Starting new range calculation...");
+      Print("Current time: ", TimeToString(TimeCurrent()));
+      Print("Range window: ", RangeStartHour, ":", StringFormat("%02d", RangeStartMinute), " - ", RangeEndHour, ":", StringFormat("%02d", RangeEndMinute));
+      
+      if (activeRange.calculateRange()) {
+         activeRange.drawRect();
+         rangeCalculated = true;
+         Print("Current day range successfully calculated and drawn.");
+         
+         // Reset order placement flags when new range is calculated
+         activeRange.buyPlaced = false;
+         activeRange.sellPlaced = false;
+         // Reset trade count for new session
+         activeRange.tradesCount = 0;
+         Print("New session started. Trade count reset to 0.");
+      } else {
+         Print("Failed to calculate current day range during OnTick.");
+      }
+   }
+   
+   // Also update current day range periodically during range calculation period
+   static datetime lastRangeUpdate = 0;
+   if (timeToCalculateRange() && activeRange.rangeCalculated && TimeCurrent() - lastRangeUpdate > 300) { // Update every 5 minutes
+      Print("Updating current day range (periodic update)...");
+      if (activeRange.calculateRange()) {
+         activeRange.drawRect();
+         lastRangeUpdate = TimeCurrent();
+         Print("Current day range updated successfully.");
+      }
+   }
+   
+   // Handle day transitions and range period completion
+   static int lastProcessedDay = 0;
+   MqlDateTime current;
+   TimeCurrent(current);
+   int today = current.day + current.mon * 100 + current.year * 10000;
+   
+   // Check for new day (reset at midnight or when we detect day change)
+   if (lastProcessedDay != today) {
+      lastProcessedDay = today;
+      // Reset range calculation flag for new day
+      if (activeRange.rangeCalculated) {
+         Print("New day detected (", today, "). Resetting range calculation flag for new session.");
+         activeRange.rangeCalculated = false;
+         activeRange.validRange = false;
+         
+         // Clear previous day's range visual
+         string oldDateStr = "";
+         MqlDateTime oldTime;
+         datetime yesterday = TimeCurrent() - 24 * 3600;
+         TimeToStruct(yesterday, oldTime);
+         oldDateStr = IntegerToString(oldTime.year) + "_" + 
+                     StringFormat("%02d", oldTime.mon) + "_" + 
+                     StringFormat("%02d", oldTime.day);
+         
+         ObjectDelete(0, "Range_" + oldDateStr + "_0");
+         ObjectDelete(0, "Trading_High_" + oldDateStr + "_0");
+         ObjectDelete(0, "Trading_Low_" + oldDateStr + "_0");
+      }
+   }
+   
+   // If range period is over, keep calculated values but don't recalculate
+   if (!timeToCalculateRange() && activeRange.rangeCalculated) {
+      // Range period ended - values are locked until next day
+      // This ensures we keep the final range from the calculation period
    }
    
    // Check if we're in trading time
@@ -706,4 +1009,32 @@ void CancelAllPendingOrders() {
    // Reset the order placement flags since orders are cancelled
    activeRange.buyPlaced = false;
    activeRange.sellPlaced = false;
+}
+
+//+------------------------------------------------------------------+
+//| Cleanup Functions                                                |
+//+------------------------------------------------------------------+
+void CleanupObjects() {
+   Print("Cleaning up chart objects...");
+   int deletedCount = 0;
+   
+   // Clean up all objects created by this EA
+   int totalObjects = ObjectsTotal(0, -1, -1);
+   
+   for (int i = totalObjects - 1; i >= 0; i--) {
+      string objName = ObjectName(0, i, -1, -1);
+      
+      // Delete objects that match our naming convention
+      if (StringFind(objName, "Range_") >= 0 || 
+          StringFind(objName, "Trading_High_") >= 0 || 
+          StringFind(objName, "Trading_Low_") >= 0) {
+         
+         if (ObjectDelete(0, objName)) {
+            deletedCount++;
+         }
+      }
+   }
+   
+   Print("Cleanup complete. Deleted ", deletedCount, " objects.");
+   ChartRedraw(0);
 }
