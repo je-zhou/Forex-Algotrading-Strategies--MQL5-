@@ -1,0 +1,42 @@
+;--- Box Breakout v1.4 Settings for XAUUSD (Gold)
+;--- Based on Optimization Pass 9 Results
+;--- Result: 15956.63, Profit: 5956.63, Expected Payoff: 16.32, Drawdown: 11.92%
+
+;--- General Settings
+Timeframe=16385
+Magic=1
+
+;--- Trade Settings
+LotSize=0.1
+RiskPercent=0.5
+TpPoints=0
+TpFactor=0
+SlFactor=1.0
+
+;--- Trailing SL Settings
+TslTriggerPoints=0
+TslTriggerFactor=1.25
+TslPoints=25
+
+;--- Trend Settings
+TradeWithTrend=0
+TrendMaTimeframe=16385
+SlowTrendMaMethod=0
+SlowTrendMaPeriod=200
+FastTrendMaMethod=2
+FastTrendMaPeriod=60
+RangeBuffer=0
+
+;--- Strategy Inputs
+RangeTimeframe=16388
+RangeStartHour=3
+RangeStartMinute=0
+RangeEndHour=7
+RangeEndMinute=30
+StopTradingHour=17
+StopTradingMinute=30
+ClosePositionsHour=19
+ClosePositionsMinute=55
+MaxTradesPerDay=1
+HistoricalDays=30
+ShowAllTradingLines=1 
