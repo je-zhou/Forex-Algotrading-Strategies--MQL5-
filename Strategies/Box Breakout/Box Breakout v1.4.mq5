@@ -541,6 +541,26 @@ void OnTick() {
          Print("Failed to calculate current day range during OnTick.");
       }
    }
+   // NEW: If we're in trade period and don't have a valid range, calculate the completed range
+   else if (timeToTrade() && !activeRange.validRange) {
+      Print("EA started during trade period without valid range. Calculating completed range for today...");
+      Print("Current time: ", TimeToString(TimeCurrent()));
+      Print("Range window was: ", RangeStartHour, ":", StringFormat("%02d", RangeStartMinute), " - ", RangeEndHour, ":", StringFormat("%02d", RangeEndMinute));
+      
+      if (activeRange.calculateRange()) {
+         activeRange.drawRect();
+         rangeCalculated = true;
+         Print("Completed range successfully calculated and drawn for trade period.");
+         
+         // Reset order placement flags for new session
+         activeRange.buyPlaced = false;
+         activeRange.sellPlaced = false;
+         activeRange.tradesCount = 0;
+         Print("Trade session initialized with completed range.");
+      } else {
+         Print("Failed to calculate completed range for trade period.");
+      }
+   }
    
    // Handle day transitions and range period completion
    static int lastProcessedDay = 0;
